@@ -16,6 +16,7 @@ from vllm.utils import cuda_device_count_stateless
 
 from .interface import DeviceCapability, Platform, PlatformEnum, _Backend
 
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
@@ -249,6 +250,9 @@ class RocmPlatform(Platform):
             if not cls.has_device_capability(90):
                 # not Instinct series GPUs.
                 logger.info("flash_attn is not supported on NAVI GPUs.")
+        elif selected_backend == _Backend.DUAL_CHUNK_FLASH_ATTN:
+            logger.info("Using DualChunkFLashAttention backend.")
+            return ("vllm.attention.backends.dual_chunk_flash_attn." "DualChunkFlashAttentionBackend")
         else:
             logger.info("%s is not supported in AMD GPUs.", selected_backend)
         logger.info("Using ROCmFlashAttention backend.")

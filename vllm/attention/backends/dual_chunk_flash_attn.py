@@ -12,15 +12,21 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
-from vllm.attention.backends.flash_attn import (FlashAttentionBackend,
-                                                FlashAttentionImpl,
-                                                FlashAttentionMetadata,
-                                                FlashAttentionMetadataBuilder)
+from vllm.attention.backends.rocm_flash_attn import (ROCmFlashAttentionBackend as FlashAttentionBackend,
+                                                ROCmFlashAttentionImpl as FlashAttentionImpl,
+                                                ROCmFlashAttentionMetadata as FlashAttentionMetadata,
+                                                ROCmFlashAttentionMetadataBuilder as FlashAttentionMetadataBuilder)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import async_tensor_h2d
-from vllm.vllm_flash_attn import (flash_attn_varlen_func,
-                                  flash_attn_with_kvcache, sparse_attn_func)
+#from vllm.vllm_flash_attn import (flash_attn_funcflash_attn_varlen_func,
+                                  #flash_attn_with_kvcache, sparse_attn_func)
+from aiter.ops.mha import flash_attn_varlen_func, flash_attn_func
+# Use standard flash_attn_func as fallback for specialized functions
+flash_attn_with_kvcache = flash_attn_func
+sparse_attn_func = flash_attn_func  # Use standard function as fallback
+
+
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUBuilder

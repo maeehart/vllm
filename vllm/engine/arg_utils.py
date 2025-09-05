@@ -1143,8 +1143,8 @@ class EngineArgs:
                 "Cuda graph is not supported with DualChunkFlashAttention. "
                 "To run the model in eager mode, set 'enforce_eager=True' "
                 "or use '--enforce-eager' in the CLI.")
-            assert current_platform.is_cuda(), (
-                "DualChunkFlashAttention is only supported on CUDA platform.")
+            assert current_platform.is_cuda() or current_platform.is_rocm(), (
+                "DualChunkFlashAttention is only supported on CUDA and rocm platforms.")
             assert not use_v1, (
                 "DualChunkFlashAttention is not supported on V1 engine. "
                 "To run the model in V0 engine, try set 'VLLM_USE_V1=0'")
