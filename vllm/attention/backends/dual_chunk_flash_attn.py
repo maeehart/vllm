@@ -233,8 +233,7 @@ class DualChunkFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
             chunked_prefill_enabled: bool, prefix_cache_hit: bool):
-        super()._add_seq_group(inter_data, chunked_prefill_enabled,
-                               prefix_cache_hit)
+        super()._add_seq_group(inter_data, chunked_prefill_enabled)
         for prompt_len, seq_len in zip(inter_data.prompt_lens,
                                        inter_data.seq_lens):
             self.orig_seq_lens.append(max(prompt_len, seq_len))
@@ -464,6 +463,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
+
+        #logger.warning('{} {} {}'.format(key.shape[0], num_prefill_tokens, num_decode_tokens))
         assert key.shape[0] == num_prefill_tokens + num_decode_tokens
         assert value.shape[0] == num_prefill_tokens + num_decode_tokens
         output = torch.empty_like(query)
