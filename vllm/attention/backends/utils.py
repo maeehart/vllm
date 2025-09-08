@@ -151,7 +151,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
-            chunked_prefill_enabled: bool):
+            chunked_prefill_enabled: bool, prefix_cache_hit: bool):
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
 
