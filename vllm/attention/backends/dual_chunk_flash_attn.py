@@ -15,7 +15,8 @@ from vllm.attention.backends.abstract import AttentionLayer, AttentionType
 from vllm.attention.backends.rocm_flash_attn import (ROCmFlashAttentionBackend as FlashAttentionBackend,
                                                 ROCmFlashAttentionImpl as FlashAttentionImpl,
                                                 ROCmFlashAttentionMetadata as FlashAttentionMetadata,
-                                                ROCmFlashAttentionMetadataBuilder as FlashAttentionMetadataBuilder)
+                                                ROCmFlashAttentionMetadataBuilder as FlashAttentionMetadataBuilder,
+                                                _get_paged_attn_module)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import async_tensor_h2d
@@ -317,8 +318,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.paged_attn_module = _get_paged_attn_module()
         if sliding_window is not None:
-    self.paged_attn_module = _get_paged_attn_module()
             # NOTE(woosuk): flash-attn's sliding window does not work with
             # paged KV cache.
             raise ValueError(
