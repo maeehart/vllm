@@ -429,6 +429,26 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
+        # Cache key/value BEFORE any processing (following ROCm implementation pattern)
+        if kv_cache is not None and kv_cache.numel() > 0:
+            key_cache = kv_cache[0]
+            value_cache = kv_cache[1]
+            paged_attn = self.paged_attn_module
+
+            # Reshape the input keys and values and store them in the cache.
+            # If kv_cache is not provided, the new key and value tensors are
+            # not cached. This happens during the initial memory profiling run.
+            paged_attn.write_to_paged_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+
         if self.original_max_position_embeddings > 0:
             if prefill_meta := attn_metadata.prefill_metadata:
                 assert prefill_meta.scaling_factor is not None
@@ -449,26 +469,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 scaling_factor = decode_meta.scaling_factor
                 key[attn_metadata.num_prefill_tokens:].mul_(
                     scaling_factor.unsqueeze(-1).unsqueeze(-1))
-
-        if kv_cache is not None and kv_cache.numel() > 0:
-            key_cache = kv_cache[0]
-            value_cache = kv_cache[1]
-            paged_attn = self.paged_attn_module
-
-            # Reshape the input keys and values and store them in the cache.
-            # If kv_cache is not provided, the new key and value tensors are
-            # not cached. This happens during the initial memory profiling run.
-            # Use aiter's reshape_and_cache directly to avoid dimension issues
-            aiter.reshape_and_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
