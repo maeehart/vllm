@@ -450,16 +450,17 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         if kv_cache is not None and kv_cache.numel() > 0:
             key_cache = kv_cache[0]
             value_cache = kv_cache[1]
+            paged_attn = self.paged_attn_module
 
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
-            ops.reshape_and_cache_flash(
+            paged_attn.write_to_paged_cache(
                 key,
                 value,
                 key_cache,
                 value_cache,
-                attn_metadata.slot_mapping.flatten(),
+                attn_metadata.slot_mapping,
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
