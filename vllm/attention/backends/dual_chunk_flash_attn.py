@@ -454,12 +454,9 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
-            # Flatten tensors from 3D to 2D for cache operations
-            key_2d = key.view(key.shape[0], -1)
-            value_2d = value.view(value.shape[0], -1)
             ops.reshape_and_cache_flash(
-                key_2d,
-                value_2d,
+                key,
+                value,
                 key_cache,
                 value_cache,
                 attn_metadata.slot_mapping.flatten(),
