@@ -23,6 +23,7 @@ from vllm.utils import async_tensor_h2d
 #from vllm.vllm_flash_attn import (flash_attn_funcflash_attn_varlen_func,
                                   #flash_attn_with_kvcache, sparse_attn_func)
 from aiter.ops.mha import flash_attn_varlen_func, flash_attn_func
+import aiter
 # Use standard flash_attn_func as fallback for specialized functions
 flash_attn_with_kvcache = flash_attn_func
 sparse_attn_func = flash_attn_func  # Use standard function as fallback
@@ -457,12 +458,13 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
-            paged_attn.write_to_paged_cache(
+            # Use aiter's reshape_and_cache directly to avoid dimension issues
+            aiter.reshape_and_cache(
                 key,
                 value,
                 key_cache,
                 value_cache,
-                attn_metadata.slot_mapping,
+                attn_metadata.slot_mapping.flatten(),
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
