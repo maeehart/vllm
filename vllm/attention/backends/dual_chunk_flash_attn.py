@@ -318,6 +318,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         if sliding_window is not None:
+    self.paged_attn_module = _get_paged_attn_module()
             # NOTE(woosuk): flash-attn's sliding window does not work with
             # paged KV cache.
             raise ValueError(
