@@ -709,8 +709,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                                                    group_size, :].unsqueeze(2)
 
                     else:
-                        current_k_head = current_k[:, head_id, :].unsqueeze(1)
-                        current_v_head = current_v[:, head_id, :].unsqueeze(1)
+                        current_k_head = current_k[:, head_id //
+                                                   group_size, :].unsqueeze(1)
+                        current_v_head = current_v[:, head_id //
+                                                   group_size, :].unsqueeze(1)
 
                     current_out = self._dual_chunk_flash_attn_prefill_func(
                         current_q_head,
