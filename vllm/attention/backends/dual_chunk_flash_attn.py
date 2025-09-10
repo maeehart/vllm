@@ -1240,6 +1240,22 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 res = res.view(q_len, q_heads, h_dim)
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
             return res, s_lse
+        # Handle GQA/MQA by expanding key/value heads to match query heads
+        if key_states.numel() == 0 or value_states.numel() == 0:
+            # Handle empty tensor case - return empty output with correct shape
+            output = torch.empty(query_states.shape[0], query_states.shape[1], query_states.shape[2], 
+                               dtype=query_states.dtype, device=query_states.device)
+            softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
+            return output, softmax_lse
+            
+        if key_states.shape[1] != query_states.shape[1]:
+            # For GQA/MQA, we need to expand key and value heads
+            group_size = query_states.shape[1] // key_states.shape[1]
+            key_states = key_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
+                key_states.shape[0], query_states.shape[1], key_states.shape[2])
+            value_states = value_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
+                value_states.shape[0], query_states.shape[1], value_states.shape[2])
+        
 
         output = flash_attn_varlen_func(
             q=query_states,
