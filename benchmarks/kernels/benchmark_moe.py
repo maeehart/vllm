@@ -53,6 +53,7 @@ def benchmark_config(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
@@ -80,6 +81,29 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
+    elif use_int4_w4a16:
+        # For int4_w4a16, weights are packed: 2 int4 values per int8 byte
+        # So the K dimension needs to be halved for packed storage
+        w1 = torch.randint(
+            -8,
+            7,
+            (
+                num_experts,
+                shard_intermediate_size,
+                hidden_size // 2,  # Packed: 2 int4 values per byte
+            ),
+            dtype=torch.int8,
+        )
+        w2 = torch.randint(
+            -8,
+            7,
+            (
+                num_experts,
+                hidden_size,
+                shard_intermediate_size // 4,  # Packed: 2 int4 values per byte
+            ),
+            dtype=torch.int8,
+        )
     else:
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
@@ -93,11 +117,30 @@ def benchmark_config(
     w2_scale = None
     a1_scale = None
     a2_scale = None
-    if use_int8_w8a16:
+    if use_int8_w8a16 or use_int4_w4a16:
+        # For int4/int8 grouped quantization, we need 3D scales
+        # Shape: (num_experts, output_dim, num_groups_k)
+        # Default group_size for int4/int8 quantization
+        group_size = 128
+        
+        # Calculate number of groups along K dimension
+        w1_num_groups_k = (hidden_size + group_size - 1) // group_size
+        w2_num_groups_k = (shard_intermediate_size // 2 + group_size - 1) // group_size
+        
+        # Scales shape: (num_experts, output_channels, num_groups)
         w1_scale = torch.randn(
-            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+            (num_experts, shard_intermediate_size, w1_num_groups_k), dtype=torch.float32
         )
-        w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+        w2_scale = torch.randn(
+            (num_experts, hidden_size, w2_num_groups_k), dtype=torch.float32
+        )
+        
+        # Set block_quant_shape for grouped quantization
+        # [0, group_size] means per-channel output quantization with grouped K dimension
+        if block_quant_shape is None:
+            block_quant_shape = [0, group_size]
+        
+        # Note: a1_scale and a2_scale remain None for weight-only quantization
     if use_deep_gemm:
         # we use the default block shape for deepgemm
         block_quant_shape = [128, 128]
@@ -140,13 +183,20 @@ def benchmark_config(
 
         if use_fp8_w8a8:
             quant_dtype = torch.float8_e4m3fn
+            weight_dtype = None
+        elif use_int4_w4a16:
+            quant_dtype = None
+            weight_dtype = "int4"
         elif use_int8_w8a16:
-            quant_dtype = torch.int8
+            quant_dtype = None
+            weight_dtype = torch.int8
         else:
             quant_dtype = None
+            weight_dtype = None
 
         quant_config = FusedMoEQuantConfig.make(
             quant_dtype=quant_dtype,
+            weight_dtype=weight_dtype,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -204,14 +254,32 @@ def benchmark_config(
 
 
 def get_rocm_tuning_space(use_fp16):
-    block_mn_range = [16, 32, 64, 128, 256]
-    block_k_range = [16, 32, 64, 128, 256]
-    if not use_fp16:
-        block_k_range.remove(16)  # BLOCK_K=16 not supported for fp8
-    num_warps_range = [1, 2, 4, 8]
-    group_m_range = [1, 4, 8, 16, 32]
-    num_stage_range = [2]
-    waves_per_eu_range = [0, 1, 2, 4]
+    # For int4/int8, use a theoretically-motivated reduced search space
+    is_quantized = not use_fp16
+    
+    if is_quantized:
+        # INT4 has 50% memory footprint, so we can use larger blocks
+        # Favor larger blocks to amortize unpacking overhead
+        block_mn_range = [32, 64, 128, 256]  # Remove 16, focus on larger blocks
+        # BLOCK_K must be multiple of 128 (group_size) for grouped quantization
+        block_k_range = [128, 256]
+        # More warps possible due to less LDS usage
+        num_warps_range = [4]  # Remove 1, 2
+        # GROUP_M affects how blocks are scheduled
+        group_m_range = [1, 8, 16]  # Common values
+        num_stage_range = [2]  # Standard double-buffering
+        # Higher occupancy possible with less LDS
+        waves_per_eu_range = [2]  # Remove 0, 1
+    else:
+        # fp16 uses full search space
+        block_mn_range = [16, 32, 64, 128, 256]
+        block_k_range = [16, 32, 64, 128, 256]
+        num_warps_range = [4]
+        group_m_range = [1, 4, 8, 16, 32]
+        num_stage_range = [2]
+        waves_per_eu_range = [0, 1, 2, 4]
+    # SPLIT_K > 1 can help for small batch sizes with large K dimension
+    split_k_range = [1] if use_fp16 else [1]  # Keep SPLIT_K=1 for int4/int8 for now
     matrix_instr_nonkdim_range = [16, 32] if use_fp16 else []
     kpack_range = [1, 2] if use_fp16 else []
 
@@ -223,6 +291,7 @@ def get_rocm_tuning_space(use_fp16):
         "num_warps": num_warps_range,
         "num_stages": num_stage_range,
         "waves_per_eu": waves_per_eu_range,
+        "SPLIT_K": split_k_range,
     }
     if use_fp16:
         param_ranges["matrix_instr_nonkdim"] = matrix_instr_nonkdim_range
@@ -246,6 +315,8 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         num_warps_range = [4, 8]
         group_m_range = [1, 16, 32, 64]
         num_stage_range = [2, 3, 4, 5]
+        # SPLIT_K=1 is standard; >1 can help for small batches with large K
+        split_k_range = [1]
 
         param_ranges = {
             "BLOCK_SIZE_M": block_m_range,
@@ -254,6 +325,7 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
             "GROUP_SIZE_M": group_m_range,
             "num_warps": num_warps_range,
             "num_stages": num_stage_range,
+            "SPLIT_K": split_k_range,
         }
 
     keys, values = zip(*param_ranges.items())
@@ -267,7 +339,14 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
     if block_quant_shape is not None and not use_fp16:
         block_n, block_k = block_quant_shape[0], block_quant_shape[1]
         for config in configs[:]:
-            if (
+            # For int4/int8 grouped quantization (block_n == 0):
+            # BLOCK_SIZE_K must be a multiple of group_size (block_k)
+            if block_n == 0:
+                if config["BLOCK_SIZE_K"] % block_k != 0:
+                    configs.remove(config)
+            # For fp8 block quantization (block_n > 0):
+            # Both BLOCK_SIZE_K and BLOCK_SIZE_N must be multiples
+            elif (
                 config["BLOCK_SIZE_K"] % block_k != 0
                 or config["BLOCK_SIZE_N"] % block_n != 0
             ):
@@ -294,15 +373,13 @@ def prune_rocm_search_space(
 # https://github.com/ROCm/triton/blob/triton-mlir/scripts/amd/gemm/tune_gemm.py#L89
 def prune_rocm_configs(M, N, K, configs, is_fp16=True):
     pruned_configs = []
+    # INT4 has half the memory footprint (0.5 bytes per element)
     elemBytes_a = 2 if is_fp16 else 1
-    elemBytes_b = 2 if is_fp16 else 1
+    elemBytes_b = 1 if is_fp16 else 0.5  # INT4 is packed, 0.5 bytes per value
 
     mfma = 16 if M < 32 or N < 32 else 32
 
-    # TODO (zhanglx): figure out the boundary between large and small gemms
-    large_gemm = False
-    if M >= 2048 and N >= 2048:
-        large_gemm = True
+    large_gemm = M >= 2048 and N >= 2048
 
     for config in configs:
         BLOCK_SIZE_M = config.get("BLOCK_SIZE_M")
@@ -314,14 +391,16 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
             matrix_instr_nonkdim = config.get("matrix_instr_nonkdim")
             if matrix_instr_nonkdim > mfma:
                 continue
+        
         if mfma == 4 and BLOCK_SIZE_K < 64:
             continue
-        # some layouts could not work properly in case
-        # number elements per thread is less 1
+        
         if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
             continue
+        
         SPLIT_K = config.get("SPLIT_K", 1)
         GROUP_M = config.get("GROUP_SIZE_M")
+        
         if is_fp16:
             if (
                 matrix_instr_nonkdim > BLOCK_SIZE_M
@@ -332,45 +411,59 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
                 continue
             if matrix_instr_nonkdim >= N and matrix_instr_nonkdim != BLOCK_SIZE_N:
                 continue
-        # Skip BLOCK_SIZE that is too large compare to M/N
-        # unless BLOCK_SIZE is already small enough
-        if M * 2 < BLOCK_SIZE_M and BLOCK_SIZE_M != 16:
+        
+        # Skip BLOCK_SIZE that is too large compared to M/N
+        # For INT4, we can be more aggressive with larger blocks
+        min_block_size = 16 if is_fp16 else 32
+        if M * 2 < BLOCK_SIZE_M and BLOCK_SIZE_M != min_block_size:
             continue
-        if N * 2 < BLOCK_SIZE_N and BLOCK_SIZE_N != 16:
+        if N * 2 < BLOCK_SIZE_N and BLOCK_SIZE_N != min_block_size:
             continue
-        # skip large split_k when not necessary
+        
         if SPLIT_K != 1 and not need_split_k(M, N, K):
             continue
-        # skip split_k that leads to EVEN_K = false
+        
         leap = SPLIT_K * BLOCK_SIZE_K
-        modv = K % leap
-        if modv != 0:
+        if K % leap != 0:
             continue
-        # skip large GROUP_M
+        
         if GROUP_M * BLOCK_SIZE_M > M and GROUP_M != 1:
             continue
-        # out of shared memory resource
-        # TODO (zhanglx): This does not consider the LDS usage in the epilogue
+        
+        # LDS calculation (shared memory usage)
         LDS = (
             BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a
             + BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b
         )
         if LDS > 65536:
             continue
-        # Skip small block sizes and num_warps for large gemm
-        # For fp16 and f8, we want to only use BLOCK_SIZE >= 64
+        
+        # For large GEMMs, use larger blocks
         if large_gemm:
             if BLOCK_SIZE_M < 64 or BLOCK_SIZE_N < 64:
                 continue
-            if BLOCK_SIZE_K < 64:
+            if BLOCK_SIZE_K < 128:  # For INT4, prefer 128 or 256
                 continue
             if num_warps < 4:
                 continue
+        
+        # For INT4, prefer larger blocks for better compute utilization
+        if not is_fp16:
+            # Small batches: use moderate blocks
+            if M < 512:
+                if BLOCK_SIZE_M > 64:
+                    continue
+                # Avoid very small blocks that don't amortize unpacking overhead
+                if BLOCK_SIZE_M < 32:
+                    continue
+            # Large batches: use larger blocks
+            else:
+                if BLOCK_SIZE_M < 32 or BLOCK_SIZE_N < 32:
+                    continue
 
         pruned_configs.append(config)
 
     return pruned_configs
-
 
 def need_split_k(SIZE_M, SIZE_N, SIZE_K):
     return (SIZE_M < 64 or SIZE_N < 64) and SIZE_K > 1024
@@ -407,6 +500,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
     ) -> tuple[dict[str, int], float]:
@@ -443,6 +537,7 @@ class BenchmarkWorker:
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a16,
             num_iters=100,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
@@ -459,6 +554,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int4_w4a16: bool,
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
@@ -466,7 +562,7 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         if current_platform.is_rocm():
-            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
+            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
             search_space = prune_rocm_search_space(
                 num_tokens,
                 shard_intermediate_size,
@@ -495,6 +591,7 @@ class BenchmarkWorker:
                         dtype,
                         use_fp8_w8a8,
                         use_int8_w8a16,
+                        use_int4_w4a16,
                         num_iters=20,
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
@@ -520,6 +617,7 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
         "GROUP_SIZE_M": config["GROUP_SIZE_M"],
         "num_warps": config["num_warps"],
         "num_stages": config["num_stages"],
+        **({"SPLIT_K": config["SPLIT_K"]} if "SPLIT_K" in config else {}),
         **(
             {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
         ),
@@ -541,6 +639,7 @@ def save_configs(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     block_quant_shape: list[int],
     save_dir: str,
 ) -> None:
@@ -640,6 +739,7 @@ def main(args: argparse.Namespace):
     dtype = torch.float16 if current_platform.is_rocm() else config.dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    use_int4_w4a16 = args.dtype == "int4_w4a16"
     block_quant_shape = get_weight_block_size_safety(config)
 
     if args.batch_size is None:
@@ -694,7 +794,7 @@ def main(args: argparse.Namespace):
         return ray.get(outputs)
 
     if args.tune:
-        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
+        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
         search_space = get_configs_compute_bound(is_fp16, block_quant_shape)
         print(f"Start tuning over {len(search_space)} configurations...")
         if use_deep_gemm:
@@ -715,6 +815,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    use_int4_w4a16,
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
@@ -734,6 +835,7 @@ def main(args: argparse.Namespace):
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a16,
             block_quant_shape,
             args.save_dir,
         )
@@ -752,6 +854,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    use_int4_w4a16,
                     block_quant_shape,
                     use_deep_gemm,
                 )
@@ -774,7 +877,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-expert-parallel", "-enable-ep", action="store_true")
     parser.add_argument(
-        "--dtype", type=str, choices=["auto", "fp8_w8a8", "int8_w8a16"], default="auto"
+        "--dtype", type=str, choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16"], default="auto"
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
     parser.add_argument(
