@@ -341,6 +341,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -386,7 +387,14 @@ class Attention(nn.Module, AttentionLayerBase):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
                 self.impl.forward(
-                    self, query, key, value, self_kv_cache, attn_metadata, output=output
+                    self,
+                    query,
+                    key,
+                    value,
+                    self_kv_cache,
+                    attn_metadata,
+                    output=output,
+                    **kwargs,
                 )
             else:
                 torch.ops.vllm.unified_attention_with_output(
@@ -401,7 +409,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
                 return self.impl.forward(
-                    self, query, key, value, self_kv_cache, attn_metadata
+                    self, query, key, value, self_kv_cache, attn_metadata, **kwargs
                 )
             else:
                 return torch.ops.vllm.unified_attention(

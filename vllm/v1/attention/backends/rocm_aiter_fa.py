@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -637,6 +638,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        cos_sin_cache: torch.Tensor | None = None,
+        rot_dim: int = 0,
+        is_neox_style: bool = True,
+        k_norm_weight: torch.Tensor | None = None,
+        q_norm_weight: torch.Tensor | None = None,
+        rms_norm_eps: float = 1e-6,
     ) -> torch.Tensor:
         """Forward pass with AiterFlashAttention.
 
@@ -647,6 +655,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
             kv_cache: shape =
                 [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
+            positions: shape = [num_tokens]
+            cos_sin_cache: shape = [max_position, rot_dim]
+            rot_dim: int
+            is_neox_style: bool
         Returns:
             shape = [num_tokens, num_heads * head_size]
         NOTE: FP8 quantization, flash-attn expect the size of
@@ -691,7 +703,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             # the reshape_and_cache_flash op uses the slot_mapping's shape
             # to determine the number of actual tokens.
 
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
+            ops.reshape_and_cache_flash(
                 key,
                 value,
                 key_cache,
@@ -700,6 +712,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                rot_dim=rot_dim,
+                is_neox_style=is_neox_style,
+                query=query,
+                k_norm_weight=k_norm_weight,
+                q_norm_weight=q_norm_weight,
+                rms_norm_eps=rms_norm_eps,
             )
 
         if self.kv_cache_dtype.startswith("fp8"):

@@ -2146,8 +2146,23 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    # Optional RoPE args
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+    rot_dim: int = 0,
+    is_neox_style: bool = True,
+    # Optional Query for fusion
+    query: torch.Tensor | None = None,
+    # Optional Norm args
+    k_norm_weight: torch.Tensor | None = None,
+    q_norm_weight: torch.Tensor | None = None,
+    rms_norm_eps: float = 1e-6,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
+    from vllm.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash,
+    )
+
+    triton_reshape_and_cache_flash(
         key,
         value,
         key_cache,
@@ -2156,6 +2171,14 @@ def reshape_and_cache_flash(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rot_dim=rot_dim,
+        is_neox_style=is_neox_style,
+        query=query,
+        k_norm_weight=k_norm_weight,
+        q_norm_weight=q_norm_weight,
+        rms_norm_eps=rms_norm_eps,
     )
 
 

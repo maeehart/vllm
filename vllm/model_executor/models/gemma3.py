@@ -214,6 +214,26 @@ class Gemma3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        if not kwargs.get("has_images", False):
+            # Fast path for text-only inputs. The performance for the text-only
+            # inputs are not affected by the naive attention below.
+            
+            # Pass unrotated and unnormalized Q and K to attn.
+            # The cache kernel will normalize and rotate Q in-place and K before caching.
+            attn_output = self.attn(
+                q, k, v,
+                positions=positions,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                rot_dim=self.rotary_emb.rotary_dim,
+                is_neox_style=self.rotary_emb.is_neox_style,
+                k_norm_weight=self.k_norm.weight,
+                q_norm_weight=self.q_norm.weight,
+                rms_norm_eps=self.config.rms_norm_eps,
+            )
+            
+            output, _ = self.o_proj(attn_output)
+            return output
+
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
@@ -221,19 +241,14 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
         k = k.flatten(-2, -1)
 
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-
-        if not kwargs.get("has_images", False):
-            # Fast path for text-only inputs. The performance for the text-only
-            # inputs are not affected by the naive attention below.
-            output, _ = self.o_proj(attn_output)
-            return output
-
         # NOTE(woosuk): Gemma3 uses bidirectional attention between image tokens
         # that correspond to the same image while using causal attention
         # otherwise. Current attention backends cannot handle this pattern, so
         # we temporarily use a naive attention implementation with mask tensors.
+        
+        # Rotate both Q and K for the naive path
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
 
         # We intentionally keep the attention backend as-is and only override
         # `attn_output` with the naive implementation's output. This minimizes
