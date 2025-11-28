@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -30,6 +31,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+# Enable pre-quantization of Q to FP8 for decode attention
+# This saves memory bandwidth and removes on-the-fly conversion
+_AITER_PRE_QUANT_Q = os.environ.get("VLLM_AITER_PRE_QUANT_Q", "0") == "1"
 
 if current_platform.is_rocm():
     import aiter
@@ -817,10 +822,28 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     device=output.device,
                 )
 
+                # Get decode query slice
+                decode_query = query[:num_decode_tokens]
+                
+                # Pre-quantize Q to FP8 if enabled (saves bandwidth and conversion)
+                if _AITER_PRE_QUANT_Q and self.kv_cache_dtype.startswith("fp8"):
+                    # Quantize Q from bf16/fp16 to FP8
+                    # Reshape: [tokens, heads, head_dim] -> [tokens * heads, head_dim]
+                    orig_shape = decode_query.shape
+                    # Use reshape() instead of view() for non-contiguous tensors
+                    q_flat = decode_query.reshape(-1, head_size)
+                    # Use dynamic per-tensor quantization
+                    q_fp8, q_scale = ops.scaled_fp8_quant(
+                        q_flat, 
+                        use_per_token_if_dynamic=False
+                    )
+                    # Reshape back to [tokens, heads, head_dim]
+                    decode_query = q_fp8.reshape(orig_shape)
+
                 torch.ops.aiter.paged_attention_v1(
                     output[:num_decode_tokens],
                     workspace_buffer,
-                    query[:num_decode_tokens],
+                    decode_query,
                     key_cache,
                     value_cache,
                     self.scale,
