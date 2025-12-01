@@ -257,7 +257,10 @@ class AiterFlashAttentionMetadata:
 class AiterFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[AiterFlashAttentionMetadata]
 ):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # Use UNIFORM_BATCH instead of UNIFORM_SINGLE_TOKEN_DECODE to support
+    # speculative decoding where each request may generate multiple tokens
+    # (draft tokens + verified token) in a single forward pass.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -303,6 +306,11 @@ class AiterFlashAttentionMetadataBuilder(
             dtype=self.model_config.dtype,
             device=device,
         )
+
+        # Enable speculative decoding support for this attention backend.
+        # supports_spec_as_decode=True allows the backend to handle speculative
+        # decoding batches where draft tokens are verified alongside decode tokens.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -924,74 +932,47 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     v_scale=layer._v_scale,
                 )
 
-            # calculate for decodes
+            # Calculate attention for decode tokens (including speculative decoding)
+            # 
+            # We use unified_attention instead of paged_attention_v1 because:
+            # 1. paged_attention_v1 expects cu_seqlens_q to be a simple range [0,1,2,...,n]
+            #    but speculative decoding produces variable query lengths per request
+            # 2. unified_attention properly handles the cumulative sequence lengths
+            #    format used in decode_metadata.query_start_loc
+            # 3. This approach works for both regular decoding and speculative decoding
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
-                if self.sliding_window[0] != -1:
-                    from aiter.ops.triton.unified_attention import (
-                        unified_attention,
-                    )
-
-                    descale_shape = (
-                        attn_metadata.query_start_loc[:num_decodes].shape[0] - 1,
-                        key_cache.shape[2],
-                    )
-                    unified_attention(
-                        q=query[:num_decode_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_decode_tokens],
-                        cu_seqlens_q=attn_metadata.query_start_loc[:num_decodes],
-                        max_seqlen_q=1,  # optimize this
-                        seqused_k=attn_metadata.seq_lens[:num_decodes],
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table[:num_decodes],
-                        softcap=self.logits_soft_cap,
-                        q_descale=None,
-                        k_descale=layer._k_scale.expand(descale_shape),
-                        v_descale=layer._v_scale.expand(descale_shape),
-                    )
-                    return
-                assert attn_metadata.decode_metadata is not None
-                _, num_heads, head_size = query.shape
-                nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-                num_seqs = attn_metadata.seq_lens.shape[0]
-                max_num_partitions = (
-                    attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
-                ) // _PARTITION_SIZE_ROCM
-
-                workspace_buffer = torch.empty(
-                    (num_seqs * num_heads * max_num_partitions * head_size)
-                    * nbytes_per_qo_elem
-                    + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-                    dtype=torch.uint8,
-                    device=output.device,
+                from aiter.ops.triton.unified_attention import (
+                    unified_attention,
+                )
+                
+                # descale_shape: (num_sequences, num_kv_heads) for FP8 KV cache scaling
+                descale_shape = (
+                    num_decodes,
+                    key_cache.shape[2],
+                )
+                unified_attention(
+                    q=query[:num_decode_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_decode_tokens],
+                    # Use decode_metadata.query_start_loc which has the correct
+                    # cumulative format [0, q1, q1+q2, ...] with num_decodes+1 elements
+                    cu_seqlens_q=attn_metadata.decode_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.decode_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens[:num_decodes],
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=attn_metadata.block_table[:num_decodes],
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
                 )
 
-                torch.ops.aiter.paged_attention_v1(
-                    output[:num_decode_tokens],
-                    workspace_buffer,
-                    query[:num_decode_tokens],
-                    key_cache,
-                    value_cache,
-                    self.scale,
-                    attn_metadata.block_table[:num_decodes],
-                    attn_metadata.query_start_loc[:num_decodes],
-                    attn_metadata.seq_lens[:num_decodes],
-                    attn_metadata.max_seq_len,
-                    self.alibi_slopes,
-                    self.kv_cache_dtype,
-                    "NHD",
-                    self.logits_soft_cap,
-                    layer._k_scale,
-                    layer._v_scale,
-                    None,
-                    _PARTITION_SIZE_ROCM,
-                )
         else:
             raise NotImplementedError(
                 "Cascade attention is not implemented for ROCM AITER"

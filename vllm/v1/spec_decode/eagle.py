@@ -165,11 +165,23 @@ class EagleProposer:
             with_numpy=True,
         )
 
-        # Determine allowed attention backends once during initialization.
+        # Determine allowed attention backends for speculative decoding.
+        # When num_speculative_tokens > 1, we need attention backends that can
+        # handle variable query lengths per request. Only certain backends support this.
         self.allowed_attn_types: tuple | None = None
         if current_platform.is_rocm():
-            rocm_types = [TritonAttentionMetadata, FlashAttentionMetadata]
-            # ROCM_AITER_FA is an optional backend
+            from vllm.v1.attention.backends.rocm_attn import (
+                RocmAttentionMetadata,
+            )
+
+            # ROCm-compatible attention backends that support speculative decoding
+            rocm_types = [
+                TritonAttentionMetadata,
+                FlashAttentionMetadata,
+                RocmAttentionMetadata,
+            ]
+            # ROCM_AITER_FA (AMD Instinct Triton Extension) is an optional backend
+            # that provides optimized attention for AMD MI series GPUs
             if find_spec(
                 AttentionBackendEnum.ROCM_AITER_FA.get_path(include_classname=False)
             ):
@@ -347,12 +359,11 @@ class EagleProposer:
             positions = target_positions[:, last_token_indices]
         else:
             positions = target_positions[last_token_indices]
-        if self.method in (
-            "deepseek_mtp",
-            "ernie_mtp",
-            "longcat_flash_mtp",
-            "pangu_ultra_moe_mtp",
-        ):
+        # MTP models (DeepSeek, GLM-4, ERNIE, etc.) use hidden states from the
+        # persistent buffer (self.hidden_states) rather than the model output.
+        # This is because MTP layers take the previous hidden states as input
+        # alongside the embedded tokens to predict the next token.
+        if self.method == "mtp":
             hidden_states = self.hidden_states[last_token_indices]
         else:
             hidden_states = hidden_states[last_token_indices]
@@ -1127,6 +1138,23 @@ class EagleProposer:
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+
+            # GLM-4 MoE MTP Architecture:
+            # Unlike DeepSeek-V3 which has a single lm_head at the model level,
+            # GLM-4 MoE MTP has a shared_head.head (ParallelLMHead) inside each
+            # MTP layer that produces logits. To ensure weight sharing and avoid
+            # loading duplicate weights, we replace each layer's shared_head.head
+            # with the target model's lm_head.
+            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                for layer in self.model.model.layers.values():
+                    if hasattr(layer, "shared_head") and hasattr(
+                        layer.shared_head, "head"
+                    ):
+                        layer.shared_head.head = target_language_model.lm_head
+                        logger.info(
+                            "Sharing target model lm_head with MTP layer's "
+                            "shared_head.head"
+                        )
 
     @torch.inference_mode()
     def dummy_run(

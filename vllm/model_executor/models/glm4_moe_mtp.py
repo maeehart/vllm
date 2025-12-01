@@ -257,9 +257,19 @@ class Glm4MoeMTP(nn.Module, SupportsPP, Glm4MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if name == "lm_head.weight":
-                spec_layer = self.model.mtp_start_layer_idx
-                name = f"model.layers.{spec_layer}.shared_head.head.weight"
+            if name.startswith("lm_head."):
+                # GLM-4 MoE MTP Architecture Note:
+                # The MTP model shares lm_head weights with the target model to avoid
+                # loading duplicate weights. The sharing is done in eagle.py load_model()
+                # where share_lm_head=True for MTP models. Skipping these weights here
+                # prevents "unexpected key" errors during weight loading.
+                continue
+            if "shared_head.head." in name:
+                # GLM-4 MoE MTP has a unique architecture where each MTP layer contains
+                # a shared_head.head (ParallelLMHead) that outputs logits. These heads
+                # are shared with the target model's lm_head in eagle.py load_model().
+                # Skip loading here to avoid duplicate weights and ensure proper sharing.
+                continue
             elif name == "model.embed_tokens.weight":
                 spec_layer = self.model.mtp_start_layer_idx
             else:

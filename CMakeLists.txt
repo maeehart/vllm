@@ -46,6 +46,12 @@ if(NOT DEFINED ROCM_PATH)
 else()
   set(ROCM_PATH ${ROCM_PATH} CACHE PATH "ROCm installation prefix" FORCE)
 endif()
+
+# Add ROCm cmake modules to CMAKE_PREFIX_PATH so that enable_language(HIP)
+# can find hip-lang and other ROCm cmake packages (required for CMake 3.31+)
+if(EXISTS "${ROCM_PATH}/lib/cmake")
+  list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib/cmake")
+endif()
 #
 # Supported/expected torch versions for CUDA/ROCm.
 #
