@@ -231,7 +231,7 @@ if current_platform.is_rocm():
         dst_k_shuffle_offset = (
             dst_offset + offset // x * block_size * x + block_offset * x + offset % x
         )
-        dst_v_shuffle_offste = (
+        dst_v_shuffle_offset = (
             dst_offset
             + block_offset // x * head_size * x
             + offset * x
@@ -247,7 +247,7 @@ if current_platform.is_rocm():
             k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
             v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
         tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
-        tl.store(value_cache_ptr + dst_v_shuffle_offste, v_val)
+        tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
 
     def reshape_and_cache_shuffle_triton(
         key: torch.Tensor,
