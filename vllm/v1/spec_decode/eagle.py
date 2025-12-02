@@ -1146,7 +1146,15 @@ class EagleProposer:
             # loading duplicate weights, we replace each layer's shared_head.head
             # with the target model's lm_head.
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-                for layer in self.model.model.layers.values():
+                # Handle both ModuleDict and ModuleList layer containers:
+                # - ModuleDict (e.g., GLM-4 MoE): keyed by layer name, use .values()
+                # - ModuleList (e.g., Kimi K2, other models): indexed, directly iterable
+                # This ensures compatibility across different model architectures.
+                layers = self.model.model.layers
+                layer_iter = (
+                    layers.values() if hasattr(layers, "values") else layers
+                )
+                for layer in layer_iter:
                     if hasattr(layer, "shared_head") and hasattr(
                         layer.shared_head, "head"
                     ):

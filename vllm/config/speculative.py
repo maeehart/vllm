@@ -167,7 +167,24 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type in ("deepseek_v3", "deepseek_v32"):
+        # Models based on DeepSeek V3 architecture that support MTP (Multi-Token
+        # Prediction) speculative decoding. These models share the same MTP layer
+        # structure and can be handled uniformly as "deepseek_mtp".
+        # - deepseek_v3/v32: Original DeepSeek V3 models
+        # - kimi_k2: Moonshot's Kimi K2, built on DeepSeek V3 architecture
+        if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "kimi_k2"):
+            # Validate that the model was actually trained with MTP layers.
+            # Some model variants (e.g., distilled or pruned versions) may not
+            # have MTP layers even if they share the base architecture. Fail
+            # early with a helpful error rather than a cryptic runtime failure.
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            if n_predict is None or n_predict == 0:
+                raise ValueError(
+                    f"Model {hf_config.model_type} does not support MTP "
+                    f"speculative decoding (num_nextn_predict_layers={n_predict}). "
+                    "The model was not trained with MTP layers. Please disable "
+                    "speculative decoding or use a different method like 'ngram'."
+                )
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
