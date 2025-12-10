@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Attention layer with PagedAttention and Triton prefix prefill."""
+"""Attention layer with PagedAttention and Triton prefix prefill.
+
+Optionally supports AITER ASM paged attention kernels for MI300X/MI325X (gfx942) and MI355X (gfx950).
+Enable with VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_ASM_PA=1.
+Requires block_size=16 and FP8 KV cache.
+"""
 
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -30,6 +36,13 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+# Log AITER ASM PA status at module load
+if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_ASM_PA:
+    logger.info(
+        "AITER ASM paged attention enabled. "
+        "Requires block_size=16 and FP8 KV cache for decode."
+    )
 
 
 @dataclass

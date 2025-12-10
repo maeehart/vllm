@@ -10,10 +10,14 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
+
+logger = init_logger(__name__)
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -300,6 +304,47 @@ def chunked_prefill_paged_decode(
     num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
     from vllm.platforms.rocm import use_rocm_custom_paged_attention
+
+    # Check if we should use AITER ASM paged attention (GCN assembly kernels)
+    # Requirements: block_size=16, FP8 KV cache, decode only (max_query_len=1)
+    use_aiter_asm_pa = (
+        envs.VLLM_ROCM_USE_AITER
+        and envs.VLLM_ROCM_USE_AITER_ASM_PA
+        and block_size == 16
+        and "fp8" in kv_cache_dtype
+        and max_query_len == 1  # Decode only
+        and alibi_slopes is None  # Not supported
+        and sliding_window == 0  # Not supported
+        and sinks is None  # Not supported
+    )
+
+    if use_aiter_asm_pa:
+        try:
+            import aiter
+            # AITER ASM paged attention for decode
+            # Uses hand-tuned GCN assembly kernels for MI300X/MI325X (gfx942) and MI355X (gfx950)
+            # Key cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+            # Value cache: [num_blocks, num_kv_heads, head_size, block_size]
+            aiter.pa_fwd_asm(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                block_table.stride(0),  # block_tables_stride0
+                max_qlen=1,  # Decode mode
+                K_QScale=k_scale,
+                V_QScale=v_scale,
+                out_=output,
+                high_precision=1,  # Use high precision FP8 accumulation
+            )
+            return  # ASM kernel handles everything
+        except Exception as e:
+            logger.warning(
+                "AITER ASM paged attention failed, falling back to default: %s",
+                str(e)
+            )
+            # Fall through to default implementation
 
     use_custom = use_rocm_custom_paged_attention(
         query.dtype,

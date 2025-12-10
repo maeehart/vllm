@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_ROCM_USE_AITER_ASM_PA: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -978,6 +979,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
+        in ("true", "1")
+    ),
+    # Use AITER ASM paged attention kernels for V1 attention (decode only)
+    # Hand-tuned GCN assembly kernels for MI300X/MI325X (gfx942) and MI355X (gfx950)
+    # Requires block_size=16 and FP8 KV cache
+    "VLLM_ROCM_USE_AITER_ASM_PA": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_ASM_PA", "False").lower()
         in ("true", "1")
     ),
     # Whether to use aiter fusion shared experts ops.
