@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -30,7 +31,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
-USING_SHUFFLE_LAYOUT = False
+
 if current_platform.is_rocm():
     import aiter
 
@@ -862,7 +863,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 token_to_batch=token_to_batch[chunk_idx],
                 seq_starts=chunk_starts[chunk_idx],
                 dequant=False,
-                kv_cache_layout="SHUFFLE" if USING_SHUFFLE_LAYOUT else "NHD",
+                kv_cache_layout="SHUFFLE" if envs.VLLM_ROCM_USE_AITER_ASM_PA else "NHD",
                 total_tokens=total_token_per_batch[chunk_idx],
             )
 
@@ -971,7 +972,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             # key[:num_actual_tokens] and value[:num_actual_tokens] because
             # the reshape_and_cache_flash op uses the slot_mapping's shape
             # to determine the number of actual tokens.
-            if USING_SHUFFLE_LAYOUT:
+            if envs.VLLM_ROCM_USE_AITER_ASM_PA:
                 reshape_and_cache_shuffle_triton(
                     key,
                     value,
@@ -1075,7 +1076,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
                 if self.sliding_window[0] != -1:
-                    assert not USING_SHUFFLE_LAYOUT, (
+                    assert not envs.VLLM_ROCM_USE_AITER_ASM_PA, (
                         "Sliding window with shuffle layout is not supported yet."
                     )
                     from aiter.ops.triton.unified_attention import (
@@ -1108,7 +1109,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     return
                 assert attn_metadata.decode_metadata is not None
 
-                if USING_SHUFFLE_LAYOUT:
+                if envs.VLLM_ROCM_USE_AITER_ASM_PA:
                     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
                     x = 16 // key_cache.element_size()
                     k_cache_template = torch.empty(
@@ -1135,6 +1136,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         K_QScale=layer._k_scale,
                         V_QScale=layer._v_scale,
                         out_=output[:num_decode_tokens],
+                        high_precision=envs.VLLM_ROCM_AITER_ASM_PA_PRECISION,
                     )
                 else:
                     _, num_heads, head_size = query.shape
