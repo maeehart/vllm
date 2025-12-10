@@ -117,4 +117,20 @@ class AiterScaledMMLinearKernel(CutlassScaledMMLinearKernel):
         # a to be [M, K]
         # b to be [N, K]
         # CutlassScaledMMLinearKernel prepare weight `w_q` in [K, N] format
+        
+        # Check if custom FP8 decode GEMM should be used for this shape
+        # This kernel is optimized for decode (small M, large N/K)
+        k = x_q.shape[1]
+        if (
+            per_token_scale_a
+            and per_channel_scale_b
+            and bias is None
+            and out_dtype is torch.bfloat16
+            and rocm_aiter_ops.should_use_fp8_gemm_decode(m, n, k)
+        ):
+            # Use custom ASM FP8 GEMM for decode workloads
+            return rocm_aiter_ops.fp8_gemm_decode(
+                x_q, w_q.t(), x_s.view(-1), w_s.view(-1)
+            )
+        
         return rocm_aiter_ops.gemm_a8w8(x_q, w_q.t(), x_s, w_s, bias, out_dtype)

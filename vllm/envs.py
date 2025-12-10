@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_ROCM_USE_CUSTOM_FP8_GEMM_DECODE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -996,6 +997,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Whether to use custom ASM FP8 GEMM for decode workloads.
+    # Optimized for small M (batch size ~128) memory-bound GEMMs.
+    # Requires AITER with custom_fp8_gemm_decode branch.
+    # By default is disabled.
+    "VLLM_ROCM_USE_CUSTOM_FP8_GEMM_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_USE_CUSTOM_FP8_GEMM_DECODE", "False").lower()
+        in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

@@ -485,6 +485,7 @@ class rocm_aiter_ops:
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _CUSTOM_FP8_GEMM_DECODE = envs.VLLM_ROCM_USE_CUSTOM_FP8_GEMM_DECODE
 
     @classmethod
     @if_aiter_supported
@@ -564,6 +565,12 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_gemm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
+
+    @classmethod
+    @if_aiter_supported
+    def is_custom_fp8_gemm_decode_enabled(cls) -> bool:
+        """Check if custom ASM FP8 GEMM for decode is enabled."""
+        return cls._AITER_ENABLED and cls._CUSTOM_FP8_GEMM_DECODE
 
     @staticmethod
     @if_aiter_supported
@@ -1042,6 +1049,70 @@ class rocm_aiter_ops:
         from aiter.ops.shuffle import shuffle_weight
 
         return tuple(shuffle_weight(tensor, layout=layout) for tensor in tensors)
+
+    @staticmethod
+    def fp8_gemm_decode(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        out: torch.Tensor | None = None,
+        split_k: int = -1,
+    ) -> torch.Tensor:
+        """
+        Custom ASM FP8 GEMM optimized for decode workloads (small M).
+        
+        This kernel targets memory-bound GEMMs typical in LLM decode phase:
+        - M is small (~128 for batch size)
+        - N and K are large (1280-28672)
+        
+        Args:
+            A: [M, K] FP8 input tensor
+            B: [N, K] FP8 weight tensor (transposed)
+            A_scale: [M] FP32 per-token scale
+            B_scale: [N] FP32 per-channel scale
+            out: Optional [M, N] BF16 output tensor
+            split_k: Split-K factor (-1 for auto)
+        
+        Returns:
+            [M, N] BF16 tensor with result
+        """
+        from aiter import fp8_gemm_decode as aiter_fp8_gemm_decode
+
+        return aiter_fp8_gemm_decode(A, B, A_scale, B_scale, out, split_k)
+
+    @staticmethod
+    def is_fp8_gemm_decode_available() -> bool:
+        """Check if custom FP8 decode GEMM kernel is available."""
+        try:
+            from aiter import is_fp8_gemm_decode_available
+
+            return is_fp8_gemm_decode_available()
+        except ImportError:
+            return False
+
+    @staticmethod
+    def should_use_fp8_gemm_decode(M: int, N: int, K: int) -> bool:
+        """
+        Determine if custom FP8 decode GEMM should be used for given shape.
+        
+        The kernel is optimized for:
+        - Small M (decode batch size, typically 16-256)
+        - Large N and K (model dimensions)
+        - N and K divisible by 128
+        """
+        if not rocm_aiter_ops.is_custom_fp8_gemm_decode_enabled():
+            return False
+        if not rocm_aiter_ops.is_fp8_gemm_decode_available():
+            return False
+        # Shape constraints
+        if M < 16 or M > 512:  # Decode batch size range
+            return False
+        if N % 128 != 0 or K % 128 != 0:
+            return False
+        if K < 128:
+            return False
+        return True
 
 
 rocm_aiter_ops.register_ops_once()
