@@ -106,23 +106,30 @@ if MORI_AVAILABLE:
         Fake implementation for torch.compile tracing.
         
         Returns tensors with shapes based on max_tokens configuration.
-        The actual shapes depend on the MORI configuration, but for tracing
-        we use conservative estimates.
+        
+        For CUDA graph compatibility, the output shapes must be deterministic.
+        MORI dispatch expands tokens to (max_tokens * world_size, hidden_dim)
+        where max_tokens is configured via max_num_inp_token_per_rank.
+        
+        The fake implementation returns tensors matching the input shape since
+        the actual expanded size depends on runtime configuration. When
+        use_cudagraph_compatible=True, the caller should ensure consistent
+        batch sizes (e.g., via cudagraph_capture_sizes padding).
         """
-        # For tracing, we need to return tensors with appropriate shapes
-        # The dispatch output shape depends on the EP configuration
-        # We use the input shape as a conservative estimate
         num_tokens, hidden_dim = input.shape
         topk = indices.shape[1]
         
-        # Dispatch expands to (max_tokens * world_size, hidden_dim)
-        # For fake impl, we use a placeholder that matches the pattern
-        # The actual size will be determined at runtime
+        # For CUDA graph compatibility, we need fixed shapes
+        # The dispatch output expands tokens based on EP world size
+        # For tracing, we use input shape as the output shape
+        # The actual runtime will handle the expansion
         dispatched_input = input.new_empty(input.shape)
         dispatched_weights = weights.new_empty(weights.shape)
         dispatched_scales = scales.new_empty(scales.shape) if scales is not None else None
         dispatched_indices = indices.new_empty(indices.shape)
-        # recv_token_counts is per-expert counts
+        # recv_token_counts: number of tokens received per local expert
+        # Shape depends on num_local_experts which we don't have here
+        # Use a placeholder that will be refined at runtime
         recv_token_counts = indices.new_empty((indices.shape[0],), dtype=torch.int32)
         
         return (dispatched_input, dispatched_weights, dispatched_scales,
@@ -214,6 +221,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
         use_cudagraph_compatible: bool = False,
+        fixed_output_size: Optional[int] = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -226,6 +234,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
         self.use_cudagraph_compatible = use_cudagraph_compatible
+        # For CUDA graph compatibility: truncate dispatch output to this size
+        # Set to batch_size * topk * world_size for decode with fixed batch sizes
+        self.fixed_output_size = fixed_output_size
         
         # Register this op instance for torch.library ops
         self.mori_op_id = _get_next_mori_op_id()
@@ -307,6 +318,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dispatch_ids,
                 dispatch_recv_token_num,
             ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
+
+        # For CUDA graph compatibility, truncate outputs to fixed size
+        # MORI dispatch expands to (max_tokens * world_size, hidden_dim)
+        # but for decode with fixed batch sizes, we only need
+        # (batch_size * topk * world_size) tokens
+        # This optimization is similar to ATOM's graph_bs handling
+        if self.use_cudagraph_compatible and self.fixed_output_size is not None:
+            fixed_size = self.fixed_output_size
+            if fixed_size < dispatch_a1.shape[0]:
+                dispatch_a1 = dispatch_a1[:fixed_size]
+                dispatch_ids = dispatch_ids[:fixed_size]
+                dispatch_weights = dispatch_weights[:fixed_size]
+                if dispatch_scale is not None:
+                    dispatch_scale = dispatch_scale[:fixed_size]
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, 
