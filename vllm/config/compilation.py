@@ -998,6 +998,22 @@ class CompilationConfig:
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
 
+        # Add fused_moe to splitting_ops when using MORI backend
+        # This excludes the MoE layer (which contains MORI dispatch/combine) from
+        # CUDA graph capture, while keeping CUDA graphs for other operations
+        # (attention, GEMM, etc.)
+        if all2all_backend == "mori":
+            moe_splitting_op = "vllm::fused_moe"
+            if self.splitting_ops is None:
+                self.splitting_ops = list(self._attention_ops)
+            if moe_splitting_op not in self.splitting_ops:
+                self.splitting_ops.append(moe_splitting_op)
+                logger.info(
+                    "MORI: Adding fused_moe to splitting_ops since MORI "
+                    "dispatch/combine kernels are not yet CUDA Graph compatible. "
+                    "Other operations will still use CUDA graphs."
+                )
+
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant
         if self.splitting_ops is None:
