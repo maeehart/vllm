@@ -1002,6 +1002,11 @@ class CompilationConfig:
         # This excludes the MoE layer (which contains MORI dispatch/combine) from
         # CUDA graph capture, while keeping CUDA graphs for other operations
         # (attention, GEMM, etc.)
+        #
+        # Note: MORI ops are registered with torch.library for future CUDA graph
+        # support. Once MORI's internal buffers are properly pre-allocated and
+        # output shapes are fixed, we can enable full CUDA graph capture by
+        # setting use_cudagraph_compatible=True in MoriPrepareAndFinalize.
         if all2all_backend == "mori":
             moe_splitting_op = "vllm::fused_moe"
             if self.splitting_ops is None:
@@ -1010,8 +1015,8 @@ class CompilationConfig:
                 self.splitting_ops.append(moe_splitting_op)
                 logger.info(
                     "MORI: Adding fused_moe to splitting_ops since MORI "
-                    "dispatch/combine kernels are not yet CUDA Graph compatible. "
-                    "Other operations will still use CUDA graphs."
+                    "dispatch/combine kernels are not yet fully CUDA Graph "
+                    "compatible. Other operations will still use CUDA graphs."
                 )
 
     def set_splitting_ops_for_attn_fusion(self):
