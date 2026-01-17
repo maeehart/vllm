@@ -114,6 +114,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import FlashInferAllToAllManager
 
                 self.all2all_manager = FlashInferAllToAllManager(self.cpu_group)
+            elif self.all2all_backend == "padded_allgather_reducescatter":
+                # CUDA graph-compatible all2all using fixed-size padded buffers
+                from .padded_ag_rs_all2all import PaddedAgRsAll2AllManager
+
+                # Get max_num_tokens from env or use default
+                max_num_tokens = int(envs.VLLM_MOE_DP_CHUNK_SIZE)
+                self.all2all_manager = PaddedAgRsAll2AllManager(
+                    self.cpu_group, max_num_tokens=max_num_tokens
+                )
+            elif self.all2all_backend == "mori":
+                # MORI dispatch/combine for ROCm EP MoE
+                from .mori_all2all import MoriAll2AllManager
+
+                self.all2all_manager = MoriAll2AllManager(self.cpu_group)
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 

@@ -43,7 +43,9 @@ All2AllBackend = Literal[
     "deepep_high_throughput",
     "deepep_low_latency",
     "allgather_reducescatter",
+    "padded_allgather_reducescatter",
     "flashinfer_all2allv",
+    "mori",  # ROCm EP MoE with MORI dispatch/combine
 ]
 
 
@@ -154,6 +156,7 @@ class ParallelConfig:
 
     - "naive": Naive all2all implementation using broadcasts\n
     - "allgather_reducescatter": All2all based on allgather and reducescatter\n
+    - "padded_allgather_reducescatter": CUDA graph-compatible all2all using fixed-size padded buffers\n
     - "pplx": Use pplx kernels\n
     - "deepep_high_throughput": Use deepep high-throughput kernels\n
     - "deepep_low_latency": Use deepep low-latency kernels\n
@@ -442,6 +445,7 @@ class ParallelConfig:
                 "naive",
                 "deepep_high_throughput",
                 "deepep_low_latency",
+                "mori",
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
