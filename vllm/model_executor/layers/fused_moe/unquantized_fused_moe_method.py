@@ -77,7 +77,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalize | None:
+        moe_cfg = self.moe.moe_parallel_config
         if self.unquantized_backend == UnquantizedMoeBackend.AITER:
+            # Allow MORI or smart_routing prepare/finalize for EP communication
+            if moe_cfg.use_mori_kernels or moe_cfg.use_smart_routing_kernels:
+                return super().maybe_make_prepare_finalize(routing_tables)
             return None
         else:
             return super().maybe_make_prepare_finalize(routing_tables)

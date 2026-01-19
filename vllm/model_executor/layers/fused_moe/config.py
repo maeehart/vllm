@@ -880,7 +880,14 @@ class FusedMoEParallelConfig:
 
     @property
     def use_mori_kernels(self):
-        return self.use_all2all_kernels and self.all2all_backend == "mori"
+        # MORI works with EP (ep_size > 1), not just DP+EP
+        # This allows pure EP (DP=1, EP=8) to use MORI
+        return self.use_ep and self.ep_size > 1 and self.all2all_backend == "mori"
+
+    @property
+    def use_smart_routing_kernels(self):
+        # Smart routing works with pure EP (ep_size > 1), not just DP+EP
+        return self.use_ep and self.ep_size > 1 and self.all2all_backend == "smart_routing"
 
     @staticmethod
     def flatten_tp_across_dp_and_pcp(
@@ -1037,6 +1044,11 @@ class FusedMoEConfig:
     router_logits_dtype: torch.dtype | None = None
 
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
+    
+    # Maximum buffer size for all2all backends (MORI, DeepEP, etc.)
+    # This should be set to scheduler_config.max_num_batched_tokens for
+    # proper memory allocation during profiling. If None, uses max_num_tokens.
+    max_buffer_tokens: int | None = None
 
     has_bias: bool = False
 
@@ -1051,6 +1063,10 @@ class FusedMoEConfig:
             )
 
         assert self.max_num_tokens > 0
+        
+        # Default max_buffer_tokens to max_num_tokens if not set
+        if self.max_buffer_tokens is None:
+            self.max_buffer_tokens = self.max_num_tokens
 
         if self.router_logits_dtype is None:
             self.router_logits_dtype = self.in_dtype
@@ -1106,6 +1122,10 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+    @property
+    def use_smart_routing_kernels(self):
+        return self.moe_parallel_config.use_smart_routing_kernels
 
     @property
     def use_flashinfer_cutlass_kernels(self):

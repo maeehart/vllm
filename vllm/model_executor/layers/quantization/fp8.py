@@ -879,11 +879,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalize | None:
+        # For AITER/MARLIN backends, check if MORI or smart_routing is enabled
+        # These backends need prepare/finalize for EP communication
+        moe_cfg = self.moe.moe_parallel_config
         if self.fp8_backend in [
             Fp8MoeBackend.AITER,
             Fp8MoeBackend.MARLIN,
             Fp8MoeBackend.FLASHINFER_TRTLLM,
         ]:
+            # Allow MORI or smart_routing prepare/finalize for EP communication
+            if moe_cfg.use_mori_kernels or moe_cfg.use_smart_routing_kernels:
+                return super().maybe_make_prepare_finalize(routing_tables)
             return None
         elif self.fp8_backend == Fp8MoeBackend.FLASHINFER_CUTLASS:
             prepare_finalize = build_flashinfer_fp8_cutlass_moe_prepare_finalize(
@@ -905,10 +911,48 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             TritonExperts,
             TritonOrDeepGemmExperts,
         )
+        from vllm.platforms import current_platform
+        if current_platform.is_rocm():
+            from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+                AiterExperts,
+            )
 
-        if self.fp8_backend in [Fp8MoeBackend.MARLIN, Fp8MoeBackend.AITER]:
+        # For MORI or smart_routing backends:
+        # - MORI: Uses AITER with original FP8 config
+        # - smart_routing: Quantizes activations AFTER routing, uses TritonExperts
+        #
+        # Smart routing works by:
+        # 1. Routing bf16 activations to destination GPUs
+        # 2. Quantizing to FP8 on destination GPU (so scales match routed tokens)
+        # 3. Running MoE kernel with FP8 w8a8
+        moe_cfg = self.moe.moe_parallel_config
+        if moe_cfg.use_smart_routing_kernels:
+            # Use TritonExperts with FP8 config
+            # SmartRoutingPrepareAndFinalize quantizes after routing
+            logger.debug(
+                "Using TritonExperts for smart_routing backend with FP8 config "
+                "(activations quantized after routing)"
+            )
+            return TritonExperts(quant_config=self.moe_quant_config)
+        
+        # For MORI, the dispatch happens before MoE kernel and tokens
+        # maintain their original layout within each GPU's portion.
+        # AITER can be used with the original w8a8 config.
+        if moe_cfg.use_mori_kernels:
+            logger.debug(
+                "Using AiterExperts for MORI backend with original FP8 config"
+            )
+            return AiterExperts(self.moe_quant_config)
+        
+        # For AITER without MORI/smart_routing
+        if self.fp8_backend == Fp8MoeBackend.AITER:
             raise NotImplementedError(
-                "Marlin and ROCm AITER are not supported with all2all yet."
+                "ROCm AITER is not supported with all2all yet (except MORI/smart_routing)."
+            )
+        
+        if self.fp8_backend == Fp8MoeBackend.MARLIN:
+            raise NotImplementedError(
+                "Marlin is not supported with all2all yet."
             )
 
         assert self.moe_quant_config is not None

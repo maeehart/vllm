@@ -197,15 +197,24 @@ def determine_expert_placement_strategy(
                 "experts. Falling back to linear expert placement."
             )
             return "linear"
+        
+        # Round-robin is supported for:
+        # - DeepEP low-latency backend
+        # - MORI backend (for balanced expert distribution with grouped topk)
+        # - Smart routing backend
+        # - Pure EP without all2all (no DP)
+        backend = moe_parallel_config.all2all_backend
+        round_robin_backends = {"deepep_low_latency", "mori", "smart_routing"}
+        
         if (
             moe_parallel_config.use_all2all_kernels
-            and not moe_parallel_config.use_deepep_ll_kernels
+            and backend not in round_robin_backends
         ):
             logger.warning(
                 "Round-robin expert placement currently only supports "
-                "the DeepEP low-latency backend, but '%s' was configured. "
-                "Falling back to linear expert placement.",
-                moe_parallel_config.all2all_backend,
+                "DeepEP low-latency, MORI, or smart_routing backends, "
+                "but '%s' was configured. Falling back to linear expert placement.",
+                backend,
             )
             return "linear"
 
@@ -587,6 +596,13 @@ class FusedMoE(CustomOp):
             else:
                 self.routing_method_type = RoutingMethodType.TopK
 
+        # Get max_buffer_tokens from scheduler config for proper buffer sizing
+        # This is needed for profiling runs which use larger batches
+        max_buffer_tokens = None
+        if (vllm_config.scheduler_config is not None and
+            hasattr(vllm_config.scheduler_config, 'max_num_batched_tokens')):
+            max_buffer_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        
         self.moe_config: FusedMoEConfig = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=top_k,
@@ -596,6 +612,7 @@ class FusedMoE(CustomOp):
             in_dtype=moe_in_dtype,
             router_logits_dtype=router_logits_dtype,
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            max_buffer_tokens=max_buffer_tokens,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
@@ -670,13 +687,16 @@ class FusedMoE(CustomOp):
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
+        print(f"[DEBUG] maybe_init_modular_kernel called: quant_method={self.quant_method.__class__.__name__}")
         self.ensure_moe_quant_config_init()
         # routing_tables only needed for round-robin expert placement with
         # DeepEP all2all backend.
         routing_tables = self._maybe_init_expert_routing_tables()
+        print(f"[DEBUG] Calling quant_method.maybe_make_prepare_finalize...")
         prepare_finalize = self.quant_method.maybe_make_prepare_finalize(
             routing_tables=routing_tables
         )
+        print(f"[DEBUG] maybe_make_prepare_finalize returned: {prepare_finalize}")
         if prepare_finalize is not None:
             logger.debug(
                 "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)

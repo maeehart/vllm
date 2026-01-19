@@ -128,6 +128,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .mori_all2all import MoriAll2AllManager
 
                 self.all2all_manager = MoriAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "smart_routing":
+                # Smart routing for EP MoE - uses NaiveAll2AllManager as base
+                # The actual smart routing logic is in SmartRoutingPrepareAndFinalize
+                from .all2all import NaiveAll2AllManager
+
+                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 

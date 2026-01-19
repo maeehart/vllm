@@ -45,7 +45,8 @@ All2AllBackend = Literal[
     "allgather_reducescatter",
     "padded_allgather_reducescatter",
     "flashinfer_all2allv",
-    "mori",  # ROCm EP MoE with MORI dispatch/combine
+    "mori",  # ROCm EP MoE with MORI dispatch/combine (all-gather pattern)
+    "smart_routing",  # ROCm EP with smart token routing (L2 cache benefits)
 ]
 
 

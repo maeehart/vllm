@@ -126,10 +126,23 @@ class DeviceCommunicatorBase:
             # we initialize the all2all manager used in expert parallel.
             use_ep = config.parallel_config.data_parallel_size > 1
             all2all_backend = config.parallel_config.all2all_backend
+            
+            # For smart_routing and mori backends, we also need all2all manager
+            # even with pure EP (DP=1, EP enabled). This is because these backends
+            # perform token routing within the EP group, not just between DP groups.
+            if (all2all_backend in ["smart_routing", "mori"] and 
+                config.parallel_config.enable_expert_parallel):
+                use_ep = True
 
         self.is_ep_communicator = "ep" in unique_name
         self.use_all2all = self.is_ep_communicator and use_ep
         self.all2all_backend = all2all_backend
+        
+        # Debug logging
+        if all2all_backend == "smart_routing":
+            print(f"[DEBUG] DeviceCommunicatorBase.__init__: unique_name={unique_name}, "
+                  f"is_ep_communicator={self.is_ep_communicator}, use_ep={use_ep}, "
+                  f"use_all2all={self.use_all2all}, all2all_backend={all2all_backend}")
         self.all2all_manager: All2AllManagerBase | None = None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -264,6 +277,8 @@ class DeviceCommunicatorBase:
         """
         Prepare the communication buffer for the model.
         """
+        print(f"[DEBUG] prepare_communication_buffer_for_model called: "
+              f"is_ep_communicator={self.is_ep_communicator}, unique_name={self.unique_name}")
         if not self.is_ep_communicator:
             return
 
@@ -277,6 +292,7 @@ class DeviceCommunicatorBase:
                 or module.__class__.__name__ == "SharedFusedMoE"
             )
         ]
+        print(f"[DEBUG] Found {len(moe_modules)} MoE modules, calling maybe_init_modular_kernel")
         for module in moe_modules:
             module.maybe_init_modular_kernel()
 

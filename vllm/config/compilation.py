@@ -998,26 +998,40 @@ class CompilationConfig:
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
 
-        # Add fused_moe to splitting_ops when using MORI backend
-        # This excludes the MoE layer (which contains MORI dispatch/combine) from
+        # Disable CUDA graphs for smart_routing backend
+        # Smart routing uses NCCL/RCCL collectives (all_to_all_single) which
+        # cannot be executed during CUDA graph capture - not even as splitting_ops,
+        # because NCCL operations fail when ANY stream is in capture mode.
+        # 
+        # For MORI backend, we use splitting_ops since MORI's dispatch/combine
+        # have been designed to be more compatible with graph capture.
+        if all2all_backend == "smart_routing" and self.cudagraph_mode != CUDAGraphMode.NONE:
+            logger.info(
+                "Smart Routing: Disabling CUDA Graphs since smart routing uses "
+                "NCCL/RCCL collectives that cannot be executed during graph capture. "
+                "torch.compile optimizations are still applied for kernel fusion."
+            )
+            self.cudagraph_mode = CUDAGraphMode.NONE
+
+        # Add MoE ops to splitting_ops when using MORI backend
+        # This excludes the MoE layer (which contains dispatch/combine) from
         # CUDA graph capture, while keeping CUDA graphs for other operations
         # (attention, GEMM, etc.)
         #
-        # Note: MORI ops are registered with torch.library for future CUDA graph
-        # support. Once MORI's internal buffers are properly pre-allocated and
-        # output shapes are fixed, we can enable full CUDA graph capture by
-        # setting use_cudagraph_compatible=True in MoriPrepareAndFinalize.
+        # Note: The ops are registered as vllm::moe_forward and 
+        # vllm::moe_forward_shared, not vllm::fused_moe.
         if all2all_backend == "mori":
-            moe_splitting_op = "vllm::fused_moe"
+            moe_splitting_ops = ["vllm::moe_forward", "vllm::moe_forward_shared"]
             if self.splitting_ops is None:
                 self.splitting_ops = list(self._attention_ops)
-            if moe_splitting_op not in self.splitting_ops:
-                self.splitting_ops.append(moe_splitting_op)
-                logger.info(
-                    "MORI: Adding fused_moe to splitting_ops since MORI "
-                    "dispatch/combine kernels are not yet fully CUDA Graph "
-                    "compatible. Other operations will still use CUDA graphs."
-                )
+            for moe_op in moe_splitting_ops:
+                if moe_op not in self.splitting_ops:
+                    self.splitting_ops.append(moe_op)
+            logger.info(
+                "MORI: Adding MoE ops to splitting_ops since "
+                "dispatch/combine kernels require special handling. "
+                "Other operations will still use CUDA graphs."
+            )
 
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant
