@@ -44,9 +44,10 @@ export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MOE=1
 
 # MORI-EP requires a large symmetric heap for All-to-All communication buffers
-# With max_num_batched_tokens=8192 and hidden_dim=7168, each operator needs ~940MB
-# Default heap (~260MB) is too small. Set to 2GB to be safe.
-export MORI_SHMEM_HEAP_SIZE="${MORI_SHMEM_HEAP_SIZE:-2G}"
+# With max_num_batched_tokens=8192 and hidden_dim=7168, each rank needs ~940MB
+# The heap is shared across all 8 GPUs, so total needed = 940MB * 8 = 7.5GB
+# Set to 12GB to be safe with headroom for other allocations.
+export MORI_SHMEM_HEAP_SIZE="${MORI_SHMEM_HEAP_SIZE:-12G}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do

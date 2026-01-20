@@ -9,18 +9,16 @@ dispatch/combine operations in MoE layers.
 Reference: https://github.com/ROCm/mori
 
 IMPORTANT: MORI requires sufficient symmetric heap memory for All-to-All
-communication buffers. The required size depends on:
-  - max_num_tokens: batch size (default 8192 for chunked prefill)
-  - hidden_dim: model hidden size (7168 for DeepSeek R1)
-  
-Approximate formula: ~(max_tokens * hidden_dim * 16 bytes) per operator
-Example: 8192 * 7168 * 16 ≈ 940 MB
+communication buffers. The heap is SHARED across all GPUs (ranks).
 
-Set the environment variable to increase heap size:
-  export MORI_SHMEM_HEAP_SIZE=2G  # or 4G for larger batches
+Memory per rank: ~(max_tokens * hidden_dim * 16 bytes) ≈ 940 MB for DeepSeek R1
+Total heap needed: 940 MB * num_ranks (e.g., 8 GPUs = 7.5 GB minimum)
 
-Default heap (~260MB) will cause "Out of symmetric heap memory" errors
-with max_num_batched_tokens=8192.
+Set the environment variable to increase heap size BEFORE starting the server:
+  export MORI_SHMEM_HEAP_SIZE=12G  # 12GB for EP8 with DeepSeek R1
+
+The benchmark script (bench_mori_ep_serve_markus.sh) sets this automatically.
+Without this, you'll see "Out of symmetric heap memory" errors.
 """
 import threading
 from dataclasses import dataclass
