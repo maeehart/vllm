@@ -8,6 +8,7 @@ dispatch/combine operations in MoE layers.
 
 Reference: https://github.com/ROCm/mori
 """
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,15 @@ except ImportError:
     EpDispatchCombineKernelType = None  # type: ignore
     _EpDispatchCombineOp = None  # type: ignore
     shmem = None  # type: ignore
+
+# Track if shmem has been initialized
+_MORI_SHMEM_INITIALIZED = False
+_MORI_SHMEM_LOCK = threading.Lock()
+
+# Global cache for MORI EP operators - shared across all MoE layers
+# Key is a tuple of (rank, world_size, hidden_dim, max_num_tokens, topk, kernel_type)
+_MORI_EP_OP_CACHE: dict[tuple, "_EpDispatchCombineOp"] = {}
+_MORI_EP_OP_CACHE_LOCK = threading.Lock()
 
 
 def is_mori_ep_available() -> bool:
@@ -111,60 +121,195 @@ def get_kernel_type(kernel_type_str: str) -> Any:
     return mapping.get(kernel_type_str, EpDispatchCombineKernelType.IntraNode)
 
 
+def _ensure_mori_shmem_initialized() -> None:
+    """
+    Ensure MORI shared memory is initialized.
+    
+    This must be called before creating any MORI EP operators.
+    Initializes MORI's shared memory layer using a unique ID broadcast
+    from rank 0 (similar to NCCL initialization pattern).
+    
+    Thread-safe - uses a lock to prevent multiple initializations.
+    """
+    global _MORI_SHMEM_INITIALIZED
+    
+    # Fast path - already initialized
+    if _MORI_SHMEM_INITIALIZED:
+        return
+    
+    with _MORI_SHMEM_LOCK:
+        # Double-check after acquiring lock
+        if _MORI_SHMEM_INITIALIZED:
+            return
+        
+        if not MORI_EP_AVAILABLE:
+            raise RuntimeError("MORI-EP not available for shmem initialization")
+        
+        import torch.distributed as dist
+        from vllm.distributed import get_world_group
+        
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "Cannot initialize MORI shmem: PyTorch distributed not initialized"
+            )
+        
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        
+        logger.info(
+            "Initializing MORI shmem: rank=%d, world_size=%d", rank, world_size
+        )
+        
+        try:
+            # Get unique ID from rank 0 and broadcast to all ranks
+            # (similar to NCCL initialization pattern)
+            if rank == 0:
+                unique_id = shmem.shmem_get_unique_id()
+                logger.info("Rank 0 generated MORI unique ID (%d bytes)", len(unique_id))
+            else:
+                unique_id = bytes(128)  # Placeholder for broadcast
+            
+            # Broadcast unique ID using vLLM's world group (has CPU backend)
+            world_group = get_world_group()
+            unique_id_list = [list(unique_id)]
+            world_group.broadcast_object_list(unique_id_list, src=0)
+            unique_id = bytes(unique_id_list[0])
+            
+            logger.info("Rank %d received MORI unique ID, calling shmem_init_attr...", rank)
+            
+            # Initialize shmem with the unique ID
+            result = shmem.shmem_init_attr(
+                shmem.MORI_SHMEM_INIT_WITH_UNIQUEID,
+                rank,
+                world_size,
+                unique_id,
+            )
+            
+            if result != 0:
+                raise RuntimeError(f"MORI shmem_init_attr returned error code: {result}")
+            
+            logger.info("MORI shmem initialized successfully on rank %d", rank)
+            _MORI_SHMEM_INITIALIZED = True
+            
+        except Exception as e:
+            raise RuntimeError(f"MORI shmem initialization failed on rank {rank}: {e}") from e
+
+
+def _make_cache_key(config: MoriEpConfig) -> tuple:
+    """
+    Create a cache key for the MORI EP operator.
+    
+    Operators with the same configuration can be shared across MoE layers.
+    """
+    return (
+        config.rank,
+        config.world_size,
+        config.hidden_dim,
+        config.max_num_tokens,
+        config.topk,
+        config.num_experts_per_rank,
+        config.kernel_type,
+        config.dtype,
+        config.use_fp8_dispatch,
+    )
+
+
 def create_mori_ep_op(config: MoriEpConfig) -> "EpDispatchCombineOp":
     """
-    Create MORI EP dispatch/combine operator.
+    Create or retrieve a cached MORI EP dispatch/combine operator.
+    
+    IMPORTANT: MORI EP operators are shared across all MoE layers to avoid
+    exhausting the symmetric heap memory. Operators with the same configuration
+    are cached and reused.
 
     Args:
         config: MoriEpConfig with all required parameters.
 
     Returns:
-        EpDispatchCombineOp: MORI EP operator handle.
+        EpDispatchCombineOp: MORI EP operator handle (may be shared).
 
     Raises:
-        AssertionError: If MORI-EP is not installed.
+        RuntimeError: If MORI-EP is not installed or operator creation fails.
     """
-    assert MORI_EP_AVAILABLE, (
-        "MORI-EP not installed. Install from https://github.com/ROCm/mori"
-    )
+    if not MORI_EP_AVAILABLE:
+        raise RuntimeError(
+            "MORI-EP not installed. Install from https://github.com/ROCm/mori"
+        )
 
-    # Create MORI EP configuration
-    mori_config = EpDispatchCombineConfig(
-        data_type=config.dtype,
-        rank=config.rank,
-        world_size=config.world_size,
-        hidden_dim=config.hidden_dim,
-        scale_dim=config.scale_dim,
-        scale_type_size=config.scale_type_size,
-        max_token_type_size=config.max_token_type_size,
-        max_num_inp_token_per_rank=config.max_num_tokens,
-        num_experts_per_rank=config.num_experts_per_rank,
-        num_experts_per_token=config.topk,
-        warp_num_per_block=config.warp_num_per_block,
-        block_num=config.block_num,
-        use_external_inp_buf=True,
-        kernel_type=get_kernel_type(config.kernel_type),
-        gpu_per_node=config.gpu_per_node,
-        rdma_block_num=config.rdma_block_num,
-        num_qp_per_pe=config.num_qp_per_pe,
-    )
+    # Ensure shmem is initialized before creating operator
+    _ensure_mori_shmem_initialized()
+    
+    # Check cache first
+    cache_key = _make_cache_key(config)
+    
+    with _MORI_EP_OP_CACHE_LOCK:
+        if cache_key in _MORI_EP_OP_CACHE:
+            logger.debug(
+                "Reusing cached MORI EP operator for rank %d/%d "
+                "(hidden=%d, max_tokens=%d, topk=%d)",
+                config.rank,
+                config.world_size,
+                config.hidden_dim,
+                config.max_num_tokens,
+                config.topk,
+            )
+            return _MORI_EP_OP_CACHE[cache_key]
+        
+        # Not in cache - create new operator
+        logger.info(
+            "Creating MORI EP operator (will be shared across layers): "
+            "world_size=%d, rank=%d, max_tokens=%d, hidden_dim=%d, topk=%d, "
+            "num_experts_per_rank=%d, kernel_type=%s",
+            config.world_size,
+            config.rank,
+            config.max_num_tokens,
+            config.hidden_dim,
+            config.topk,
+            config.num_experts_per_rank,
+            config.kernel_type,
+        )
 
-    # Create the operator
-    op = _EpDispatchCombineOp(mori_config)
+        try:
+            # Create MORI EP configuration
+            mori_config = EpDispatchCombineConfig(
+                data_type=config.dtype,
+                rank=config.rank,
+                world_size=config.world_size,
+                hidden_dim=config.hidden_dim,
+                scale_dim=config.scale_dim,
+                scale_type_size=config.scale_type_size,
+                max_token_type_size=config.max_token_type_size,
+                max_num_inp_token_per_rank=config.max_num_tokens,
+                num_experts_per_rank=config.num_experts_per_rank,
+                num_experts_per_token=config.topk,
+                warp_num_per_block=config.warp_num_per_block,
+                block_num=config.block_num,
+                use_external_inp_buf=True,
+                kernel_type=get_kernel_type(config.kernel_type),
+                gpu_per_node=config.gpu_per_node,
+                rdma_block_num=config.rdma_block_num,
+                num_qp_per_pe=config.num_qp_per_pe,
+            )
 
-    logger.info(
-        "Created MORI EP operator: world_size=%d, rank=%d, max_tokens=%d, "
-        "hidden_dim=%d, topk=%d, num_experts=%d, kernel_type=%s",
-        config.world_size,
-        config.rank,
-        config.max_num_tokens,
-        config.hidden_dim,
-        config.topk,
-        config.num_experts,
-        config.kernel_type,
-    )
+            # Create the operator
+            op = _EpDispatchCombineOp(mori_config)
+            
+            # Cache it for reuse by other layers
+            _MORI_EP_OP_CACHE[cache_key] = op
 
-    return op
+            logger.info(
+                "Successfully created and cached MORI EP operator for rank %d/%d",
+                config.rank,
+                config.world_size,
+            )
+
+            return op
+        except Exception as e:
+            raise RuntimeError(
+                f"MORI EP operator creation failed on rank {config.rank}: {e}. "
+                f"Config: world_size={config.world_size}, hidden_dim={config.hidden_dim}, "
+                f"max_tokens={config.max_num_tokens}, kernel_type={config.kernel_type}"
+            ) from e
 
 
 def init_mori_shmem_from_process_group(group_name: str = "default") -> int:
