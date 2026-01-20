@@ -217,6 +217,7 @@ def make_unquantized_moe_kernel(
                     num_local_experts=num_local_experts,
                     rank_expert_offset=rank_expert_offset,
                     ep_size=ep_size,
+                    num_experts=moe_config.num_experts,
                     dp_size=moe_config.moe_parallel_config.dp_size,
                 ),
                 AiterExperts(quant_config),

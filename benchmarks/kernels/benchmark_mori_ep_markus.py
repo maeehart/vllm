@@ -119,10 +119,23 @@ def create_test_data(
     hidden_size: int,
     num_experts: int,
     topk: int,
+    ep_size: int = 1,
+    intermediate_size: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create test data for MoE benchmark."""
+    """Create test data for MoE benchmark.
+    
+    Args:
+        num_tokens: Number of input tokens
+        hidden_size: Model hidden dimension
+        num_experts: Total number of experts (global)
+        topk: Number of experts per token
+        ep_size: Expert parallelism size (weights created for local experts only)
+        intermediate_size: MoE FFN intermediate size (default: 2048 for DeepSeek-R1)
+        dtype: Data type for tensors
+        device: Device to create tensors on
+    """
     # Input activations
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
 
@@ -136,13 +149,24 @@ def create_test_data(
     topk_weights = torch.softmax(topk_weights, dim=-1)
     topk_ids = topk_ids.to(torch.int32)
 
-    # Expert weights (simplified - actual weights would be loaded from model)
-    intermediate_size = hidden_size * 4  # Typical FFN expansion
+    # Expert weights - only create for LOCAL experts (num_experts // ep_size)
+    # DeepSeek-R1 uses moe_intermediate_size=2048 (not hidden*4)
+    if intermediate_size is None:
+        intermediate_size = 2048  # DeepSeek-R1 default
+    
+    num_local_experts = num_experts // ep_size
+    logger.info(
+        "Creating weights for %d local experts (total=%d, ep_size=%d), "
+        "intermediate_size=%d",
+        num_local_experts, num_experts, ep_size, intermediate_size
+    )
+    
+    # w1: gate_up_proj [E, 2*I, H], w2: down_proj [E, H, I]
     w1 = torch.randn(
-        num_experts, 2 * intermediate_size, hidden_size, dtype=dtype, device=device
+        num_local_experts, 2 * intermediate_size, hidden_size, dtype=dtype, device=device
     )
     w2 = torch.randn(
-        num_experts, hidden_size, intermediate_size, dtype=dtype, device=device
+        num_local_experts, hidden_size, intermediate_size, dtype=dtype, device=device
     )
 
     return x, topk_weights, topk_ids, w1, w2
@@ -373,9 +397,9 @@ def run_benchmark(
         ep_size,
     )
 
-    # Create test data
+    # Create test data (weights only for local experts in EP mode)
     x, topk_weights, topk_ids, w1, w2 = create_test_data(
-        num_tokens, hidden_size, num_experts, topk, dtype
+        num_tokens, hidden_size, num_experts, topk, ep_size, dtype=dtype
     )
 
     latency_us = 0.0
