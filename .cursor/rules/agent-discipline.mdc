@@ -1,0 +1,96 @@
+---
+description: Agent discipline rules - forbidden actions, tool wrappers, commit discipline, package management
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# ⚠️ STOP — READ THESE RULES BEFORE EVERY ACTION ⚠️
+
+## 🚫 FORBIDDEN ACTIONS (Never do without explicit permission)
+1. **pip install** — ALWAYS run `pip show <pkg>` first. Editable installs persist.
+2. **Reinstall packages** — Ask first: "Package X missing. Reinstall? (was editable)"
+3. **Push to upstream** — Only push to YOUR fork
+4. **Retry failed approaches** — Check [TRIED] comments, try something DIFFERENT
+5. **Give up silently** — Always offer alternatives before abandoning
+6. **Ignore `*_markus.*` wrappers** — If wrapper exists, use it. Don't read original tool.
+
+## ✅ ALWAYS DO
+1. Check for `*_markus.{sh|py}` wrappers before using repo tools
+2. Commit every ~50-100 lines
+3. Ask before changing/removing tasks
+
+---
+
+# Agent Discipline Rules (Details)
+
+## Tool Creation & Reuse
+
+### Before creating ANY tool:
+1. Search the repo: `scripts/`, `tools/`, `benchmarks/`, `utils/`
+2. READ existing tool headers to understand capabilities
+3. If found similar: ASK "Found `scripts/X.sh` — extend it or create new?"
+
+### One-liners vs Proper Tools:
+- ONE-LINER OK: Simple, < 3 lines, immediate, single-use (grep, find, python -c)
+- PROPER TOOL REQUIRED: > 3-5 lines, reusable, needs arguments, complex logic
+
+### When creating a tool:
+- Place in: `scripts/`, `tools/`, or `benchmarks/`
+- MUST include self-documenting header with: PURPOSE, USAGE, ARGUMENTS, EXAMPLES, DEPENDENCIES
+
+### Wrapper Scripts (`_markus` suffix):
+When existing repo tools are undocumented or have complex interfaces:
+1. Check for `*_markus.*` wrapper first (both `.sh` AND `.py`) → use directly if exists
+2. No wrapper? Create one: `<descriptive_name>_markus.{sh|py}`
+3. Wrapper calls the original tool with our documented interface
+4. Only expose commonly-used options with sensible defaults
+5. **Always use `*_markus.*` tools directly** — don't re-read original tools
+6. Use `.py` for complex logic/data processing, `.sh` for simple command orchestration
+
+## Attempt Tracking (Prevent Loops)
+
+Use INLINE CODE COMMENTS to track failed approaches - they stay with the code:
+
+- After failure: add `// [TRIED] approach - reason it failed` at that code location
+- Multiple [TRIED] comments can stack up - that's fine, shows history
+- Agent sees these when reading code → won't retry failed approaches
+- Clean up [TRIED] comments when creating PR
+
+## No Silent Abandonment
+
+When stuck:
+- ✗ NEVER say "this is too complex" and move on
+- ✓ ALWAYS offer alternatives: "I've tried A, B, C. Options: 1) Try D, 2) Clarify X, 3) Abandon (OK?)"
+- ✓ ONLY abandon with explicit user permission
+
+## Commit Discipline
+
+- Commit every ~50-100 lines changed
+- Use `gh` CLI for GitHub (install if needed: `winget install GitHub.cli` / `apt install gh` / `brew install gh`)
+- Authenticate: `gh auth login` (opens browser for token)
+- Work on user's fork: `gh repo fork --clone` if fork doesn't exist
+- Never push to upstream without explicit permission
+
+## Goal Stability
+
+- Marking tasks complete: OK without asking
+- Removing/changing tasks: REQUIRES user permission
+- Format: "I'd like to change [current] to [proposed] because [reason]. Approve?"
+
+## Package Installation Discipline
+
+⚠️ **NEVER reinstall packages without explicit user instruction:**
+- Before ANY `pip install`: run `pip show <package>` to check if installed
+- Editable installs (`pip install -e .`) PERSIST — do NOT reinstall
+- ImportError? Check these FIRST before reinstalling:
+  1. Is the correct venv/conda env activated?
+  2. Is the package path in `sys.path`?
+  3. Did you `cd` to the right directory?
+- If still failing: ASK "Package X appears missing. Should I reinstall? (Note: it was installed as editable)"
+
+## Concept Diagrams
+
+When working on complex topics, create a diagram for the technical_diagrams repo:
+- ONE file per concept with notes embedded
+- Location: diagrams/{architecture,dataflow,memory,parallelism,roofline,workflow}/
+- Purpose: Knowledge consolidation - user adds insights over time
