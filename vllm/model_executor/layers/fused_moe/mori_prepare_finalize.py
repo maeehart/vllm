@@ -482,6 +482,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         combined_x = combine_result[0]
 
+        # MORI combine returns a fixed-size buffer [max_num_tokens, hidden_dim]
+        # but the actual batch may be smaller. Slice to match output shape.
+        num_tokens = output.shape[0]
+        if combined_x.shape[0] != num_tokens:
+            combined_x = combined_x[:num_tokens]
+
         # Clear dispatch metadata for this ubatch
         self._dispatch_metadata[ubatch_idx] = {}
 
