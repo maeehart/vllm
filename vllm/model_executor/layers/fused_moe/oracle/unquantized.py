@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 class UnquantizedMoeBackend(Enum):
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
+    AITER_MORI_EP = "ROCm AITER + MORI EP"  # True EP with MORI dispatch/combine
     TRITON = "TRITON"
     CPU = "CPU"
     XPU = "XPU"
@@ -110,7 +111,11 @@ def convert_to_unquantized_kernel_format(
     w13_weight: torch.Tensor | None = None,
     w2_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if unquantized_backend == UnquantizedMoeBackend.AITER:
+    if unquantized_backend in (
+        UnquantizedMoeBackend.AITER,
+        UnquantizedMoeBackend.AITER_MORI_EP,
+    ):
+        # Both AITER and AITER_MORI_EP use the same weight format
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(
             layer.w13_weight.data, layer.w2_weight.data
         )
@@ -159,6 +164,64 @@ def make_unquantized_moe_kernel(
             MoEPrepareAndFinalizeNoEP(),
             AiterExperts(quant_config),
         )
+    elif backend == UnquantizedMoeBackend.AITER_MORI_EP:
+        # MORI-EP + AITER: True EP with MORI dispatch/combine
+        from vllm.model_executor.layers.fused_moe.mori_prepare_finalize import (
+            MoriPrepareAndFinalize,
+            is_mori_ep_available,
+        )
+        from vllm.model_executor.layers.fused_moe.mori_utils import (
+            MoriEpConfig,
+            compute_num_local_experts,
+            compute_rank_expert_offset,
+            create_mori_ep_op,
+        )
+        from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+            AiterExperts,
+        )
+
+        if not is_mori_ep_available():
+            logger.warning(
+                "MORI-EP not available, falling back to AITER without EP"
+            )
+            kernel = mk.FusedMoEModularKernel(
+                MoEPrepareAndFinalizeNoEP(),
+                AiterExperts(quant_config),
+            )
+        else:
+            # Calculate EP parameters
+            ep_size = moe_config.moe_parallel_config.ep_size
+            ep_rank = moe_config.moe_parallel_config.ep_rank
+            num_local_experts = compute_num_local_experts(
+                moe_config.num_experts, ep_size
+            )
+            rank_expert_offset = compute_rank_expert_offset(
+                ep_rank, num_local_experts
+            )
+
+            # Create MORI EP config and operator
+            mori_config = MoriEpConfig(
+                rank=ep_rank,
+                world_size=ep_size,
+                hidden_dim=moe_config.hidden_dim,
+                max_num_tokens=moe_config.max_num_tokens,
+                num_experts=moe_config.num_experts,
+                topk=moe_config.experts_per_token,
+                dtype=moe_config.in_dtype,
+            )
+            mori_ep_op = create_mori_ep_op(mori_config)
+
+            kernel = mk.FusedMoEModularKernel(
+                MoriPrepareAndFinalize(
+                    ep_op=mori_ep_op,
+                    num_local_experts=num_local_experts,
+                    rank_expert_offset=rank_expert_offset,
+                    ep_size=ep_size,
+                    dp_size=moe_config.moe_parallel_config.dp_size,
+                ),
+                AiterExperts(quant_config),
+                moe_parallel_config=moe_config.moe_parallel_config,
+            )
     elif backend == UnquantizedMoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe import TritonExperts
 
