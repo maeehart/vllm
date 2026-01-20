@@ -7,6 +7,20 @@ This module provides utilities for creating and managing MORI EP
 dispatch/combine operations in MoE layers.
 
 Reference: https://github.com/ROCm/mori
+
+IMPORTANT: MORI requires sufficient symmetric heap memory for All-to-All
+communication buffers. The required size depends on:
+  - max_num_tokens: batch size (default 8192 for chunked prefill)
+  - hidden_dim: model hidden size (7168 for DeepSeek R1)
+  
+Approximate formula: ~(max_tokens * hidden_dim * 16 bytes) per operator
+Example: 8192 * 7168 * 16 ≈ 940 MB
+
+Set the environment variable to increase heap size:
+  export MORI_SHMEM_HEAP_SIZE=2G  # or 4G for larger batches
+
+Default heap (~260MB) will cause "Out of symmetric heap memory" errors
+with max_num_batched_tokens=8192.
 """
 import threading
 from dataclasses import dataclass
@@ -231,9 +245,24 @@ def create_mori_ep_op(config: MoriEpConfig) -> "EpDispatchCombineOp":
     Raises:
         RuntimeError: If MORI-EP is not installed or operator creation fails.
     """
+    import os
+    
     if not MORI_EP_AVAILABLE:
         raise RuntimeError(
             "MORI-EP not installed. Install from https://github.com/ROCm/mori"
+        )
+
+    # Check if MORI heap size is configured
+    # Approximate memory needed: max_tokens * hidden_dim * 16 bytes (BF16 + metadata)
+    estimated_mb = (config.max_num_tokens * config.hidden_dim * 16) // (1024 * 1024)
+    heap_size_str = os.environ.get("MORI_SHMEM_HEAP_SIZE", "")
+    if not heap_size_str:
+        logger.warning(
+            "MORI_SHMEM_HEAP_SIZE not set! Estimated memory needed: ~%d MB. "
+            "Default heap (~260MB) may be too small. "
+            "Set MORI_SHMEM_HEAP_SIZE=2G or larger to avoid 'Out of symmetric "
+            "heap memory' errors.",
+            estimated_mb,
         )
 
     # Ensure shmem is initialized before creating operator

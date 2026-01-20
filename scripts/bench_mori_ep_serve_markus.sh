@@ -43,6 +43,11 @@ MAX_MODEL_LEN=72000  # ISL + some buffer
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MOE=1
 
+# MORI-EP requires a large symmetric heap for All-to-All communication buffers
+# With max_num_batched_tokens=8192 and hidden_dim=7168, each operator needs ~940MB
+# Default heap (~260MB) is too small. Set to 2GB to be safe.
+export MORI_SHMEM_HEAP_SIZE="${MORI_SHMEM_HEAP_SIZE:-2G}"
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
