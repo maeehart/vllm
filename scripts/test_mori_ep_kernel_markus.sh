@@ -19,6 +19,10 @@
 
 set -e
 
+# Enable AITER for ROCm
+export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER_MOE=1
+
 # Default values
 CONFIG="deepseek-r1"
 NUM_TOKENS=4096

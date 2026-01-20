@@ -121,10 +121,10 @@ class DeviceCommunicatorBase:
 
         config = get_current_vllm_config_or_none()
         if config is not None:
-            # as long as we use data parallel (coupled data parallel
-            # where all data parallel ranks execute forward together),
-            # we initialize the all2all manager used in expert parallel.
-            use_ep = config.parallel_config.data_parallel_size > 1
+            # Initialize all2all manager when expert parallelism is enabled.
+            # EP can be used with DP (data_parallel_size > 1) OR with TP
+            # (tensor_parallel_size > 1 with enable_expert_parallel=True)
+            use_ep = config.parallel_config.enable_expert_parallel
             all2all_backend = config.parallel_config.all2all_backend
 
         self.is_ep_communicator = "ep" in unique_name

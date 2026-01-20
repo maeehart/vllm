@@ -45,6 +45,7 @@ All2AllBackend = Literal[
     "deepep_low_latency",
     "allgather_reducescatter",
     "flashinfer_all2allv",
+    "mori_ep",  # MORI dispatch/combine + AITER compute (AMD MI300X)
 ]
 
 
@@ -158,7 +159,8 @@ class ParallelConfig:
     - "pplx": Use pplx kernels\n
     - "deepep_high_throughput": Use deepep high-throughput kernels\n
     - "deepep_low_latency": Use deepep low-latency kernels\n
-    - "flashinfer_all2allv": Use flashinfer alltoallv kernels for mnnvl"""
+    - "flashinfer_all2allv": Use flashinfer alltoallv kernels for mnnvl\n
+    - "mori_ep": MORI dispatch/combine + AITER compute (AMD MI300X)"""
 
     max_parallel_loading_workers: int | None = None
     """Maximum number of parallel loading workers when loading model

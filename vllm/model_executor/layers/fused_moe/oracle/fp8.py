@@ -311,9 +311,44 @@ def make_fp8_moe_kernel(
             AiterExperts,
         )
 
-        kernel = mk.FusedMoEModularKernel(
+        # Check if MORI-EP should be used for dispatch/combine
+        prepare_finalize: mk.FusedMoEPrepareAndFinalize
+        # Debug: log MORI-EP check details  
+        logger.info(
+            "AITER backend: use_mori_ep=%s, use_all2all=%s, all2all_backend=%s, "
+            "use_ep=%s, ep_size=%d",
+            moe_config.use_mori_ep_kernels,
+            moe_config.moe_parallel_config.use_all2all_kernels,
+            moe_config.moe_parallel_config.all2all_backend,
+            moe_config.moe_parallel_config.use_ep,
+            moe_config.moe_parallel_config.ep_size,
+        )
+        if moe_config.use_mori_ep_kernels:
+            from vllm.model_executor.layers.fused_moe.all2all_utils import (
+                maybe_make_prepare_finalize,
+            )
+
+            logger.info_once(
+                "Using ROCm AITER + MORI-EP backend for FP8 MoE", scope="local"
+            )
+            prepare_finalize_or_none = maybe_make_prepare_finalize(
+                moe_config, moe_quant_config
+            )
+            if prepare_finalize_or_none is not None:
+                prepare_finalize = prepare_finalize_or_none
+            else:
+                # Fallback if MORI init fails
+                logger.warning("MORI-EP init failed, falling back to NoEP")
+                prepare_finalize = MoEPrepareAndFinalizeNoEP(defer_input_quant=True)
+        else:
             # TODO: make defer_input_quant an attr of the AiterExperts
-            MoEPrepareAndFinalizeNoEP(defer_input_quant=True),
+            logger.debug(
+                "MORI-EP not enabled, using MoEPrepareAndFinalizeNoEP"
+            )
+            prepare_finalize = MoEPrepareAndFinalizeNoEP(defer_input_quant=True)
+
+        kernel = mk.FusedMoEModularKernel(
+            prepare_finalize,
             AiterExperts(quant_config=moe_quant_config),
         )
     elif fp8_backend == Fp8MoeBackend.MARLIN:

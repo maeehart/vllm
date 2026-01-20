@@ -865,7 +865,9 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        return self.dp_size > 1 and self.use_ep
+        # All2All kernels are used when EP is enabled and there's more than 1 EP rank
+        # This can happen with DP > 1 or TP converted to EP (ep_size > 1)
+        return self.use_ep and self.ep_size > 1
 
     @property
     def use_pplx_kernels(self):
@@ -1106,6 +1108,10 @@ class FusedMoEConfig:
     @property
     def use_deepep_ll_kernels(self):
         return self.moe_parallel_config.use_deepep_ll_kernels
+
+    @property
+    def use_mori_ep_kernels(self):
+        return self.moe_parallel_config.use_mori_ep_kernels
 
     @property
     def use_flashinfer_cutlass_kernels(self):

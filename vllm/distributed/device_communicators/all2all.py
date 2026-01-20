@@ -12,6 +12,15 @@ from vllm.logger import init_logger
 from vllm.utils.flashinfer import has_flashinfer_all2all
 from vllm.utils.import_utils import has_deep_ep, has_pplx
 
+# Check MORI availability (ROCm-specific)
+try:
+    from vllm.model_executor.layers.fused_moe.mori_prepare_finalize import (
+        is_mori_ep_available,
+    )
+    HAS_MORI = is_mori_ep_available()
+except ImportError:
+    HAS_MORI = False
+
 from .base_device_communicator import All2AllManagerBase, Cache
 
 if has_flashinfer_all2all():
@@ -507,3 +516,66 @@ class FlashInferAllToAllManager(All2AllManagerBase):
                 self.prepare_workspace_tensor = None
                 self.mapping = None
                 self.initialized = False
+
+
+class MoriAll2AllManager(All2AllManagerBase):
+    """
+    All2All communication manager for MORI-EP (AMD MI300X).
+    
+    MORI-EP handles dispatch/combine directly in the MoE layer via 
+    EpDispatchCombineOp, so this manager is minimal - it just provides
+    the interface expected by vLLM's EP infrastructure.
+    
+    The actual work is done by MoriPrepareAndFinalize in the FusedMoE layer.
+    """
+
+    def __init__(self, cpu_group):
+        if not HAS_MORI:
+            raise RuntimeError(
+                "MORI-EP not available. Install from https://github.com/ROCm/mori"
+            )
+        super().__init__(cpu_group)
+        self.handle_cache = Cache()
+        logger.info(
+            "MoriAll2AllManager initialized: rank=%d, world_size=%d",
+            self.rank,
+            self.world_size,
+        )
+
+    def get_handle(self, kwargs):
+        """
+        MORI handles are created per-layer in MoriPrepareAndFinalize.
+        This returns self as a placeholder.
+        """
+        return self
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        MORI dispatch is handled by MoriPrepareAndFinalize.prepare().
+        This method should not be called directly.
+        """
+        raise NotImplementedError(
+            "MORI dispatch is handled by MoriPrepareAndFinalize, "
+            "not the All2AllManager"
+        )
+
+    def combine(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        """
+        MORI combine is handled by MoriPrepareAndFinalize.finalize().
+        This method should not be called directly.
+        """
+        raise NotImplementedError(
+            "MORI combine is handled by MoriPrepareAndFinalize, "
+            "not the All2AllManager"
+        )
+
+    def destroy(self):
+        pass

@@ -35,9 +35,14 @@ Target workload: DeepSeek-R1 style
 
 import argparse
 import gc
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
+
+# Enable AITER before importing vllm (must be done before import)
+os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
+os.environ.setdefault("VLLM_ROCM_USE_AITER_MOE", "1")
 
 import torch
 
@@ -71,26 +76,30 @@ def check_backend_availability() -> dict[str, bool]:
         "triton": True,  # Always available
         "aiter": False,
         "mori_ep": False,
+        "mori_ep_aiter": False,  # MORI dispatch/combine + AITER compute
         "deepep_ht": False,
         "deepep_ll": False,
         "pplx": False,
     }
 
-    # Check AITER
+    # Check AITER - refresh env vars since we set them after initial import
     try:
         from vllm._aiter_ops import rocm_aiter_ops
 
+        rocm_aiter_ops.refresh_env_variables()
         available["aiter"] = rocm_aiter_ops.is_fused_moe_enabled()
     except ImportError:
         pass
 
-    # Check MORI-EP
+    # Check MORI-EP (note: requires EP8+ with shmem init to actually run)
     try:
         from vllm.model_executor.layers.fused_moe.mori_prepare_finalize import (
             is_mori_ep_available,
         )
 
         available["mori_ep"] = is_mori_ep_available()
+        # MORI-EP + AITER is available if both are available
+        available["mori_ep_aiter"] = available["mori_ep"] and available["aiter"]
     except ImportError:
         pass
 
@@ -417,20 +426,28 @@ def run_benchmark(
                 x, topk_weights, topk_ids, w1, w2, num_iters, warmup_iters
             )
         elif backend == "mori_ep":
-            # Benchmark dispatch/combine separately
-            dispatch_latency_us, combine_latency_us = benchmark_mori_ep_dispatch_combine(
-                x, topk_weights, topk_ids, ep_size, num_experts, num_iters, warmup_iters
+            # NOTE: MORI-EP requires EP8+ with shmem init
+            # On single GPU, only benchmark dispatch/combine if possible
+            logger.warning(
+                "MORI-EP requires multi-GPU EP8+ setup. "
+                "Skipping dispatch/combine benchmark on single GPU."
             )
-            # Also benchmark AITER compute
+            dispatch_latency_us = None
+            combine_latency_us = None
+            # Still benchmark AITER compute as proxy
             compute_latency_us = benchmark_aiter_moe(
                 x, topk_weights, topk_ids, w1, w2, num_iters, warmup_iters
             )
-            # Total latency is sum of all phases
-            latency_us = (
-                (dispatch_latency_us or 0)
-                + (compute_latency_us or 0)
-                + (combine_latency_us or 0)
+            latency_us = compute_latency_us or 0
+        elif backend == "mori_ep_aiter":
+            # MORI dispatch/combine + AITER compute (full pipeline)
+            # Requires EP8+ multi-GPU setup
+            logger.warning(
+                "mori_ep_aiter requires multi-GPU EP8+ setup with torchrun. "
+                "Use: torchrun --nproc_per_node=8 %s --backends mori_ep_aiter",
+                __file__,
             )
+            return None
         else:
             logger.warning("Unknown backend: %s", backend)
             return None

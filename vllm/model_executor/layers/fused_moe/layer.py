@@ -519,6 +519,19 @@ class FusedMoE(CustomOp):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
 
+        # For MORI-EP (EP without DP), use scheduler's max_num_batched_tokens
+        # instead of the DP chunk size, as MORI needs to handle full batches
+        moe_max_num_tokens = envs.VLLM_MOE_DP_CHUNK_SIZE
+        if (self.moe_parallel_config.use_ep 
+            and self.moe_parallel_config.all2all_backend == "mori_ep"
+            and self.moe_parallel_config.dp_size == 1):
+            # Use scheduler's max_num_batched_tokens for MORI-EP without DP
+            moe_max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            logger.info(
+                "MORI-EP: Using max_num_tokens=%d from scheduler config",
+                moe_max_num_tokens
+            )
+
         self.moe_config: FusedMoEConfig = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=top_k,
@@ -527,7 +540,7 @@ class FusedMoE(CustomOp):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=moe_in_dtype,
             router_logits_dtype=router_logits_dtype,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            max_num_tokens=moe_max_num_tokens,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,

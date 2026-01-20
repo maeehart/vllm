@@ -1,3 +1,19 @@
+#!/bin/bash
+# ========================================================================
+# TOOL: setup_cursor_rules_markus.sh
+# PURPOSE: Create/replace .cursor/rules/ with agent discipline rules
+# USAGE: bash setup_cursor_rules_markus.sh
+# ========================================================================
+
+mkdir -p .cursor/rules
+
+# Remove existing rules file if present (we replace, not merge)
+if [[ -f .cursor/rules/agent-discipline.mdc ]]; then
+    echo "⚠️  Replacing existing .cursor/rules/agent-discipline.mdc"
+    rm .cursor/rules/agent-discipline.mdc
+fi
+
+cat > .cursor/rules/agent-discipline.mdc << 'RULES_EOF'
 ---
 description: Agent discipline rules - forbidden actions, tool wrappers, commit discipline, package management
 globs: ["**/*"]
@@ -96,3 +112,8 @@ When working on complex topics, create a diagram for the technical_diagrams repo
 - ONE file per concept with notes embedded
 - Location: diagrams/{architecture,dataflow,memory,parallelism,roofline,workflow}/
 - Purpose: Knowledge consolidation - user adds insights over time
+RULES_EOF
+
+echo "✅ Created .cursor/rules/agent-discipline.mdc"
+echo ""
+echo "Next: git add .cursor/rules/ && git commit -m 'add: cursor agent discipline rules'"

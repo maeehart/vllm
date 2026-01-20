@@ -31,6 +31,14 @@ if current_platform.is_cuda_alike():
             DeepEPLLPrepareAndFinalize,
         )
 
+# MORI-EP is ROCm-specific
+if current_platform.is_rocm():
+    from .mori_prepare_finalize import (
+        MoriPrepareAndFinalize,
+        is_mori_ep_available,
+    )
+    from .mori_utils import MoriEpConfig, create_mori_ep_op
+
 
 def maybe_roundup_layer_hidden_size(
     hidden_size: int,
@@ -168,6 +176,34 @@ def maybe_make_prepare_finalize(
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,
             local_expert_global_ids=local_expert_global_ids,
+        )
+
+    elif moe.use_mori_ep_kernels:
+        # MORI-EP: AMD-optimized dispatch/combine + AITER compute
+        if not current_platform.is_rocm() or not is_mori_ep_available():
+            raise RuntimeError(
+                "MORI-EP backend requires ROCm platform and MORI package. "
+                "Install from https://github.com/ROCm/mori"
+            )
+
+        mori_config = MoriEpConfig(
+            rank=all2all_manager.rank,
+            world_size=all2all_manager.world_size,
+            hidden_dim=moe.hidden_dim,
+            max_num_tokens=moe.max_num_tokens,
+            num_experts=moe.num_experts,
+            topk=moe.experts_per_token,
+            dtype=moe.in_dtype,
+        )
+        ep_op = create_mori_ep_op(mori_config)
+
+        prepare_finalize = MoriPrepareAndFinalize(
+            ep_op=ep_op,
+            num_local_experts=moe.num_local_experts,
+            rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
+            ep_size=all2all_manager.world_size,
+            num_experts=moe.num_experts,
+            dp_size=moe.dp_size,
         )
 
     return prepare_finalize
