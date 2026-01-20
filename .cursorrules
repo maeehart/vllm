@@ -1,0 +1,93 @@
+# Agent Discipline Rules
+
+## Tool Creation & Reuse
+
+### Before creating ANY tool:
+1. Search the repo: `scripts/`, `tools/`, `benchmarks/`, `utils/`
+2. READ existing tool headers to understand capabilities
+3. If found similar: ASK "Found `scripts/X.sh` — extend it or create new?"
+
+### One-liners vs Proper Tools:
+- ONE-LINER OK: Simple, < 3 lines, immediate, single-use (grep, find, python -c)
+- PROPER TOOL REQUIRED: > 3-5 lines, reusable, needs arguments, complex logic
+
+### When creating a tool:
+- Place in: `scripts/`, `tools/`, or `benchmarks/`
+- MUST include self-documenting header with: PURPOSE, USAGE, ARGUMENTS, EXAMPLES, DEPENDENCIES
+- Header format:
+  ```
+  #!/bin/bash
+  # ========================================================================
+  # TOOL: name.sh
+  # PURPOSE: What it does
+  # USAGE: ./scripts/name.sh [--flag] <arg>
+  # ARGUMENTS: --flag  Description
+  # EXAMPLES: ./scripts/name.sh --release
+  # DEPENDENCIES: List required tools
+  # ========================================================================
+  ```
+
+### Wrapper Scripts (`_markus` suffix):
+When existing repo tools are undocumented or have complex interfaces:
+1. Check for `*_markus.sh` wrapper first → use directly if exists
+2. No wrapper? Create one: `<descriptive_name>_markus.sh`
+3. Wrapper calls the original tool with our documented interface
+4. Only expose commonly-used options with sensible defaults
+5. **Always use `*_markus.sh` tools directly** — don't re-read original tools
+
+Wrapper header format:
+  ```
+  #!/bin/bash
+  # ========================================================================
+  # WRAPPER: benchmark_moe_markus.sh
+  # WRAPS: scripts/run_benchmark.py (original repo tool)
+  # PURPOSE: Run MoE benchmarks with standard configurations
+  # USAGE: ./scripts/benchmark_moe_markus.sh [--experts N] [--batch B]
+  # ========================================================================
+  ```
+
+## Attempt Tracking (Prevent Loops)
+
+Use INLINE CODE COMMENTS to track failed approaches - they stay with the code:
+
+- After failure: add `// [TRIED] approach - reason it failed` at that code location
+- Multiple [TRIED] comments can stack up - that's fine, shows history
+- Agent sees these when reading code → won't retry failed approaches
+- Clean up [TRIED] comments when creating PR (see PR workflow)
+
+Example:
+```python
+def forward(self, x):
+    # [TRIED] torch.cuda.empty_cache() here - slowed down by 40%
+    # [TRIED] pre-allocating output - OOM on batch>64
+    # Current: memory pooling (works for batch<=64)
+    ...
+```
+
+## No Silent Abandonment
+
+When stuck:
+- ✗ NEVER say "this is too complex" and move on
+- ✓ ALWAYS offer alternatives: "I've tried A, B, C. Options: 1) Try D, 2) Clarify X, 3) Abandon (OK?)"
+- ✓ ONLY abandon with explicit user permission
+
+## Commit Discipline
+
+- Commit every ~50-100 lines changed
+- Use `gh` CLI for GitHub (install if needed: `winget install GitHub.cli` / `apt install gh` / `brew install gh`)
+- Authenticate: `gh auth login` (opens browser for token)
+- Work on user's fork: `gh repo fork --clone` if fork doesn't exist
+- Never push to upstream without explicit permission
+
+## Goal Stability
+
+- Marking tasks complete: OK without asking
+- Removing/changing tasks: REQUIRES user permission
+- Format: "I'd like to change [current] to [proposed] because [reason]. Approve?"
+
+## Concept Diagrams
+
+When working on complex topics, create a diagram for the technical_diagrams repo:
+- ONE file per concept with notes embedded
+- Location: diagrams/{architecture,dataflow,memory,parallelism,roofline,workflow}/
+- Purpose: Knowledge consolidation - user adds insights over time

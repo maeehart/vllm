@@ -1,7 +1,7 @@
 #!/bin/bash
 # ========================================================================
 # WRAPPER: benchmark_mori_ep_markus.sh
-# WRAPS: benchmarks/kernels/benchmark_mori_ep_moe.py
+# WRAPS: benchmarks/kernels/benchmark_mori_ep_markus.py
 # PURPOSE: Run MORI-EP + AITER MoE benchmarks with standard configurations
 # USAGE: ./scripts/benchmark_mori_ep_markus.sh [--config CONFIG] [--tokens N]
 # ARGUMENTS:
@@ -96,7 +96,7 @@ case $CONFIG in
 esac
 
 # Build command
-CMD="python benchmarks/kernels/benchmark_mori_ep_moe.py"
+CMD="python benchmarks/kernels/benchmark_mori_ep_markus.py"
 CMD="$CMD --num-tokens $NUM_TOKENS"
 CMD="$CMD --hidden-size $HIDDEN_SIZE"
 CMD="$CMD --num-experts $NUM_EXPERTS"
