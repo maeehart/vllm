@@ -264,12 +264,32 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         # Unpack dispatch result
         # Based on mori/python/mori/ops/dispatch_combine.py:
-        # Returns tuple from launch_dispatch
-        recv_x = dispatch_result[0]
-        recv_weights = dispatch_result[1] if len(dispatch_result) > 1 else None
-        recv_scale = dispatch_result[2] if len(dispatch_result) > 2 else None
-        recv_topk_ids = dispatch_result[3] if len(dispatch_result) > 3 else None
-        # recv_src_pos = dispatch_result[4] if len(dispatch_result) > 4 else None
+        # Returns tuple from launch_dispatch:
+        #   (out_tokens, out_weights, out_scales, out_indices, total_recv_token_num)
+        #
+        # CRITICAL: MORI returns FIXED-SIZE buffers [max_num_tokens, ...]
+        # but actual token count is in dispatch_result[4].
+        # We MUST slice to actual size to avoid wasted compute!
+        recv_x_full = dispatch_result[0]
+        recv_weights_full = dispatch_result[1] if len(dispatch_result) > 1 else None
+        recv_scale_full = dispatch_result[2] if len(dispatch_result) > 2 else None
+        recv_topk_ids_full = dispatch_result[3] if len(dispatch_result) > 3 else None
+        total_recv_tokens = dispatch_result[4] if len(dispatch_result) > 4 else None
+
+        # Slice to actual received token count to avoid computing on empty padding
+        # Without this, decode with 128 tokens would compute on 8192 tokens (98% waste!)
+        if total_recv_tokens is not None:
+            num_recv = int(total_recv_tokens.item())
+            recv_x = recv_x_full[:num_recv]
+            recv_weights = recv_weights_full[:num_recv] if recv_weights_full is not None else None
+            recv_scale = recv_scale_full[:num_recv] if recv_scale_full is not None else None
+            recv_topk_ids = recv_topk_ids_full[:num_recv] if recv_topk_ids_full is not None else None
+        else:
+            # Fallback if MORI doesn't return token count (shouldn't happen)
+            recv_x = recv_x_full
+            recv_weights = recv_weights_full
+            recv_scale = recv_scale_full
+            recv_topk_ids = recv_topk_ids_full
 
         if has_scales:
             expert_x = recv_x
