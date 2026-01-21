@@ -339,6 +339,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # expert_map[global_id] = local_id (or -1 if not on this rank)
             # AITER will filter out experts where expert_map gives -1
             expert_topk_ids = recv_topk_ids.to(torch.int64)
+            
+            # Debug: Show expert_x shape to understand received data
+            if os.environ.get("VLLM_MORI_DEBUG"):
+                print(f"[MORI DEBUG] expert_x shape after slice={expert_x.shape}")
         else:
             expert_topk_ids = None
 
@@ -502,6 +506,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_meta = self._dispatch_metadata[ubatch_idx]
         original_topk_ids = dispatch_meta.get("original_topk_ids", topk_ids)
         original_topk_weights = dispatch_meta.get("original_topk_weights", topk_weights)
+        
+        # Debug: print shapes to understand the data flow
+        import os
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            print(f"[MORI COMBINE DEBUG] fused_expert_output shape={fused_expert_output.shape}")
+            print(f"[MORI COMBINE DEBUG] original_topk_ids shape={original_topk_ids.shape}")
+            print(f"[MORI COMBINE DEBUG] topk_ids (received) shape={topk_ids.shape}")
+            print(f"[MORI COMBINE DEBUG] output shape={output.shape}")
 
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
