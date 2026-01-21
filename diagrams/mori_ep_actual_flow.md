@@ -2,9 +2,15 @@
 
 ## Context
 - **Model**: DeepSeek-R1 (256 experts, topk=8)
-- **Setup**: 8 GPUs, each owns 32 experts
-- **Mode**: Decode (1 token per rank)
+- **Setup**: 8 GPUs (TP=8), each owns 32 experts
+- **Mode**: Decode (1 token per rank, but with TP=8, ALL ranks have SAME token!)
 - **Rank 0** owns experts **0-31**
+
+## ⚠️ KEY INSIGHT FROM DEBUGGING:
+With **Tensor Parallelism (TP=8)**, all 8 GPUs process the **SAME token**!
+- All 8 ranks dispatch the **identical** token with **identical** routing
+- Each rank receives the same token **8 times** from 8 different source ranks
+- `src_token_pos` is a **buffer offset** (rank × 8192), NOT a token index
 
 ---
 

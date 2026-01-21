@@ -669,7 +669,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 import os
                 if os.environ.get("VLLM_MORI_DEBUG"):
                     print(f"[MORI EXPAND] Expanding {fused_expert_output.shape[0]} -> {self._dedup_inverse_indices.numel()}")
+                    print(f"[MORI EXPAND] inverse_indices={self._dedup_inverse_indices.tolist()}")
                 fused_expert_output = fused_expert_output[self._dedup_inverse_indices]
+                if os.environ.get("VLLM_MORI_DEBUG"):
+                    print(f"[MORI EXPAND] AFTER expand: fused_expert_output shape={fused_expert_output.shape}")
 
         # MORI combine expects BF16
         assert fused_expert_output.dtype == torch.bfloat16, (
@@ -701,6 +704,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             print(f"[MORI COMBINE DEBUG] PRE-combine buffer shape={pre_combine_out.shape}")
             print(f"[MORI COMBINE DEBUG] PRE-combine buffer[0]: "
                   f"mean={pre_combine_out[0].float().mean().item():.4f}")
+        
+        # DEBUG: Check what's being passed to combine
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            print(f"[MORI COMBINE INPUT] fused_expert_output shape={fused_expert_output.shape}")
+            print(f"[MORI COMBINE INPUT] original_topk_ids shape={original_topk_ids.shape}")
+            if fused_expert_output.numel() > 0:
+                print(f"[MORI COMBINE INPUT] fused_expert_output[0] mean={fused_expert_output[0].float().mean().item():.4f}")
         
         combine_result = self.ep_op.combine(
             input=fused_expert_output,
