@@ -555,13 +555,17 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         ubatch_idx = dbo_current_ubatch_id()
 
-        # Note: We use the RECEIVED topk_ids for combine (passed as parameter),
-        # not the original ones stored in dispatch_metadata.
+        # Retrieve ORIGINAL topk_ids from dispatch metadata
+        # CRITICAL: Combine needs the ORIGINAL indices [M, 8] (this rank's tokens)
+        # to know what results to receive, NOT the received indices [N_recv, 8]!
+        dispatch_meta = self._dispatch_metadata[ubatch_idx]
+        original_topk_ids = dispatch_meta.get("original_topk_ids", topk_ids)
         
         # Debug: print shapes to understand the data flow
         import os
         if os.environ.get("VLLM_MORI_DEBUG"):
             print(f"[MORI COMBINE DEBUG] fused_expert_output shape={fused_expert_output.shape}")
+            print(f"[MORI COMBINE DEBUG] original_topk_ids shape={original_topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] topk_ids (received) shape={topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] output shape={output.shape}")
 
@@ -601,14 +605,16 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # topk_weights during expert computation. Passing weights here would
         # cause MORI to accumulate them unnecessarily (wasted bandwidth).
         #
-        # CRITICAL: Use the RECEIVED topk_ids (not original) so combine can
-        # route each expert output back to its original token owner!
+        # CRITICAL: Use ORIGINAL topk_ids (this rank's tokens), NOT received!
+        # Combine uses original indices to:
+        # 1. Route expert results BACK to original token owners
+        # 2. Know what results THIS rank expects to receive
         # - fused_expert_output: [N_recv, H] - expert outputs for received tokens
-        # - topk_ids: [N_recv, K] - indices of received tokens (for routing)
+        # - original_topk_ids: [M, K] - THIS rank's original tokens' expert choices
         combine_result = self.ep_op.combine(
             input=fused_expert_output,
             weights=None,  # AITER already applied weights
-            indices=topk_ids.to(torch.int32),
+            indices=original_topk_ids.to(torch.int32),
             call_reset=True,  # Reset for next iteration
         )
 
