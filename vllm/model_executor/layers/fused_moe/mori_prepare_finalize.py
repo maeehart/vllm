@@ -334,8 +334,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 print(f"[MORI DEBUG] num_valid={num_valid if 'num_valid' in dir() else 'N/A'}")
                 print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}, num_local_experts={self.num_local_experts}")
             
-            # Convert global to local by subtracting offset
-            expert_topk_ids = recv_topk_ids.to(torch.int64) - self.rank_expert_offset
+            # Keep GLOBAL IDs - let expert_map handle the conversion
+            # MORI copies full topk_ids (all 8 experts) for each received token.
+            # expert_map[global_id] = local_id (or -1 if not on this rank)
+            # AITER will filter out experts where expert_map gives -1
+            expert_topk_ids = recv_topk_ids.to(torch.int64)
         else:
             expert_topk_ids = None
 
@@ -493,6 +496,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         ubatch_idx = dbo_current_ubatch_id()
 
+        # Retrieve ORIGINAL topk_ids from dispatch metadata
+        # CRITICAL: combine needs the ORIGINAL indices [M, 8] to route back
+        # to original token owners, NOT the received indices [N_recv, 8]!
+        dispatch_meta = self._dispatch_metadata.get(ubatch_idx, {})
+        original_topk_ids = dispatch_meta.get("original_topk_ids", topk_ids)
+        original_topk_weights = dispatch_meta.get("original_topk_weights", topk_weights)
+
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
         if fused_expert_output.numel() != 0:
@@ -519,10 +529,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # NOTE: We pass weights=None because AITER fused_moe already applies
         # topk_weights during expert computation. Passing weights here would
         # cause MORI to accumulate them unnecessarily (wasted bandwidth).
+        #
+        # CRITICAL: Must use ORIGINAL topk_ids (before MORI dispatch modified them)
+        # so combine can route results back to the correct original tokens!
         combine_result = self.ep_op.combine(
             input=fused_expert_output,
             weights=None,  # AITER already applied weights
-            indices=topk_ids.to(torch.int32),
+            indices=original_topk_ids.to(torch.int32),
             call_reset=True,  # Reset for next iteration
         )
 
