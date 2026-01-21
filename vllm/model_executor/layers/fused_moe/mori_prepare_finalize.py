@@ -226,6 +226,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # MORI dispatch - send tokens to expert owners
         # dispatch(input, weights, scales, indices)
         # Returns: (recv_x, recv_weights, recv_scale, recv_topk_ids, recv_src_pos)
+        import os
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            ep_rank = self.rank_expert_offset // self.num_local_experts
+            print(f"[MORI DISPATCH DEBUG] ep_rank={ep_rank}, "
+                  f"tokens shape={tokens.shape}, topk_ids shape={topk_ids.shape}")
+        
         dispatch_result = self.ep_op.dispatch(
             input=tokens,
             weights=topk_weights,
@@ -621,18 +627,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # - fused_expert_output: [N_recv, H] - expert outputs for received tokens
         # - original_topk_ids: [M, K] - THIS rank's original tokens' expert choices
         #
-        # CRITICAL FIX: Copy to registered shmem buffer before combine!
-        # MORI's combine kernel uses shared memory for inter-GPU communication.
-        # The input must be in the registered buffer for other ranks to access.
-        combine_input_buffer = self.ep_op.get_registered_combine_input_buffer(
-            fused_expert_output.dtype
-        )
-        num_recv = fused_expert_output.shape[0]
-        if num_recv > 0:
-            combine_input_buffer[:num_recv].copy_(fused_expert_output)
+        # Debug: Check output buffer BEFORE combine
+        import os
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            # Check what's in the output buffer before combine
+            pre_combine_out = self.ep_op.get_registered_combine_input_buffer(
+                fused_expert_output.dtype if fused_expert_output.numel() > 0 else torch.bfloat16
+            )
+            print(f"[MORI COMBINE DEBUG] PRE-combine buffer shape={pre_combine_out.shape}")
+            print(f"[MORI COMBINE DEBUG] PRE-combine buffer[0]: "
+                  f"mean={pre_combine_out[0].float().mean().item():.4f}")
         
         combine_result = self.ep_op.combine(
-            input=combine_input_buffer[:num_recv] if num_recv > 0 else fused_expert_output,
+            input=fused_expert_output,
             weights=None,  # AITER already applied weights
             indices=original_topk_ids.to(torch.int32),
             call_reset=True,  # Reset for next iteration
@@ -641,11 +648,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         combined_x = combine_result[0]
 
         # Debug: check combine output values
-        import os
         if os.environ.get("VLLM_MORI_DEBUG"):
             print(f"[MORI COMBINE DEBUG] combine_result[0] shape={combined_x.shape}")
             if combined_x.numel() > 0:
-                print(f"[MORI COMBINE DEBUG] combined_x: "
+                # Check first token specifically
+                print(f"[MORI COMBINE DEBUG] combined_x[0]: "
+                      f"mean={combined_x[0].float().mean().item():.4f}, "
+                      f"std={combined_x[0].float().std().item():.4f}")
+                print(f"[MORI COMBINE DEBUG] combined_x (full): "
                       f"mean={combined_x.float().mean().item():.4f}, "
                       f"std={combined_x.float().std().item():.4f}, "
                       f"nan_count={torch.isnan(combined_x).sum().item()}, "
