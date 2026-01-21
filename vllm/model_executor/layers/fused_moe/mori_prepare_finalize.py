@@ -311,14 +311,31 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 if recv_topk_ids is not None:
                     recv_topk_ids = recv_topk_ids[:num_valid]
 
-        # Expert ID handling: Keep GLOBAL IDs for AITER
-        # MORI dispatch returns the ORIGINAL global expert IDs (0-255).
-        # AITER expects GLOBAL IDs when expert_map is provided:
-        #   - expert_map[global_id] -> local_id (or -1 if not on this rank)
-        #   - AITER uses this internally to route to correct local expert
+        # Expert ID handling: Convert GLOBAL IDs to LOCAL IDs
         #
-        # DO NOT modify recv_topk_ids! Pass global IDs directly to AITER.
-        expert_topk_ids = recv_topk_ids
+        # MORI dispatch returns GLOBAL expert IDs (0-255), same as router output.
+        # But after MORI dispatch, each rank ONLY has tokens for its local experts.
+        # We need LOCAL IDs (0-31) for AITER when expert_map=None.
+        #
+        # Conversion: local_id = global_id - rank_expert_offset
+        # Example: Rank 2 (offset=64), global ID 70 → local ID 6
+        #
+        # IMPORTANT: recv_topk_ids has shape [N_recv, topk] with ALL original
+        # expert IDs. But after MORI routing, only IDs for THIS rank are valid.
+        # We convert all IDs to local and let AITER use expert_map to filter.
+        if recv_topk_ids is not None:
+            # Debug: print shapes and values
+            import os
+            if os.environ.get("VLLM_MORI_DEBUG"):
+                print(f"[MORI DEBUG] rank={self.ep_rank}, recv_topk_ids shape={recv_topk_ids.shape}")
+                print(f"[MORI DEBUG] recv_topk_ids[:3]={recv_topk_ids[:3].tolist() if recv_topk_ids.numel() > 0 else 'empty'}")
+                print(f"[MORI DEBUG] num_valid={num_valid if 'num_valid' in dir() else 'N/A'}")
+                print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}")
+            
+            # Convert global to local by subtracting offset
+            expert_topk_ids = recv_topk_ids.to(torch.int64) - self.rank_expert_offset
+        else:
+            expert_topk_ids = None
 
         # Strategy B: BF16 dispatch, quantize after receive
         # MORI kernels support block-quantized dispatch (Strategy A)
