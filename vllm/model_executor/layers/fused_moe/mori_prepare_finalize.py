@@ -230,11 +230,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         # Record the handle/metadata for this ubatch
+        # Store original batch size for efficient slicing (avoids full 8192 buffer)
+        # topk_ids.shape = [M, K] where M = batch tokens, K = topk
+        # Max tokens any rank receives = M * K (if all experts on one rank)
+        original_batch_size = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        max_recv_tokens = original_batch_size * topk  # Upper bound, no GPU transfer!
+        
         ubatch_idx = dbo_current_ubatch_id()
         self._dispatch_metadata[ubatch_idx] = {
             "dispatch_result": dispatch_result,
             "original_topk_ids": topk_ids,
             "original_topk_weights": topk_weights,
+            "max_recv_tokens": max_recv_tokens,  # For efficient slicing
         }
 
         return lambda: self._receiver(
@@ -243,6 +251,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             num_experts=num_experts,
             a1_scale=a1_scale,
             quant_config=quant_config,
+            max_recv_tokens=max_recv_tokens,
         )
 
     def _receiver(
@@ -252,6 +261,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
+        max_recv_tokens: int,
     ) -> mk.PrepareResultType:
         """
         Process dispatch results and prepare for expert computation.
@@ -267,21 +277,28 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Returns tuple from launch_dispatch:
         #   (out_tokens, out_weights, out_scales, out_indices, total_recv_token_num)
         #
-        # NOTE: MORI returns FIXED-SIZE buffers [max_num_tokens, ...].
-        # We CANNOT slice here based on actual token count because:
-        # 1. Getting the count requires .item() which transfers GPU->CPU
-        # 2. This is not allowed during CUDA graph capture
+        # MORI returns FIXED-SIZE buffers [max_num_tokens, ...] (e.g., [8192, 7168])
+        # but we can slice to reduce wasted compute!
         #
-        # [TRIED] Slicing here to reduce compute - fails during CUDA graph capture
-        #         because .item() causes hipErrorStreamCaptureUnsupported
+        # [TRIED] Using total_recv_tokens.item() - fails during CUDA graph capture
+        #         because .item() transfers GPU->CPU (hipErrorStreamCaptureUnsupported)
         #
-        # The wasted compute on padding is unfortunately unavoidable with CUDA graphs.
-        # The slicing in _finalize_impl handles the output correctly.
-        recv_x = dispatch_result[0]
-        recv_weights = dispatch_result[1] if len(dispatch_result) > 1 else None
-        recv_scale = dispatch_result[2] if len(dispatch_result) > 2 else None
-        recv_topk_ids = dispatch_result[3] if len(dispatch_result) > 3 else None
-        # recv_src_pos = dispatch_result[4] if len(dispatch_result) > 4 else None
+        # SOLUTION: Use max_recv_tokens computed from input tensor SHAPE (Python int)
+        # max_recv_tokens = original_batch_size * topk = upper bound of actual tokens
+        # This is CUDA-graph safe because tensor.shape is Python metadata, no GPU access!
+        #
+        # Example: batch=512, topk=8 → max_recv=4096 instead of 8192 → 50% less waste!
+        recv_x_full = dispatch_result[0]
+        recv_weights_full = dispatch_result[1] if len(dispatch_result) > 1 else None
+        recv_scale_full = dispatch_result[2] if len(dispatch_result) > 2 else None
+        recv_topk_ids_full = dispatch_result[3] if len(dispatch_result) > 3 else None
+        # total_recv_tokens = dispatch_result[4]  # Actual count, but can't use during graph capture
+        
+        # Slice to upper bound (CUDA-graph safe - uses Python int, not GPU tensor)
+        recv_x = recv_x_full[:max_recv_tokens]
+        recv_weights = recv_weights_full[:max_recv_tokens] if recv_weights_full is not None else None
+        recv_scale = recv_scale_full[:max_recv_tokens] if recv_scale_full is not None else None
+        recv_topk_ids = recv_topk_ids_full[:max_recv_tokens] if recv_topk_ids_full is not None else None
 
         if has_scales:
             expert_x = recv_x
