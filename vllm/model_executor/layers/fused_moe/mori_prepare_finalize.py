@@ -562,7 +562,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         import os
         if os.environ.get("VLLM_MORI_DEBUG"):
             print(f"[MORI COMBINE DEBUG] fused_expert_output shape={fused_expert_output.shape}")
-            print(f"[MORI COMBINE DEBUG] original_topk_ids shape={original_topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] topk_ids (received) shape={topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] output shape={output.shape}")
 
