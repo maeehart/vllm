@@ -5,6 +5,53 @@
 MORI-EP (Multi-GPU Optimized Routing Interface for Expert Parallelism) handles
 the All-to-All communication needed when experts are distributed across GPUs.
 
+---
+
+## 🔑 CORRECTED EXPERT ID FLOW (Jan 2026)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     EXPERT ID FLOW (CORRECTED)                              │
+│                                                                             │
+│  DeepSeek-R1: 256 experts (global IDs 0-255) across 8 GPUs                 │
+│               32 experts per GPU (local IDs 0-31)                          │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ STEP 1: Router produces GLOBAL expert IDs                           │   │
+│  │                                                                     │   │
+│  │   topk_ids = [70, 134, 5, 200, ...]  ← GLOBAL IDs (0-255)          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ STEP 2: MORI dispatch sends tokens to correct ranks                 │   │
+│  │                                                                     │   │
+│  │   Token with expert 70 → sent to Rank 2 (owns experts 64-95)        │   │
+│  │   MORI copies tokenIndices unchanged to output                      │   │
+│  │   recv_topk_ids = [70, ...]  ← Still GLOBAL IDs!                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ STEP 3: Pass GLOBAL IDs to AITER unchanged                          │   │
+│  │                                                                     │   │
+│  │   expert_topk_ids = recv_topk_ids  ← Keep GLOBAL! (70)              │   │
+│  │                                                                     │   │
+│  │   ❌ PREVIOUS BUG: recv_topk_ids + offset → 70+64 = 134 (WRONG!)    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ STEP 4: AITER uses expert_map for global→local conversion           │   │
+│  │                                                                     │   │
+│  │   On Rank 2:                                                        │   │
+│  │     expert_map[70] = 6    ← Local ID for computation                │   │
+│  │     expert_map[0]  = -1   ← Not on this rank, skip                  │   │
+│  │                                                                     │   │
+│  │   AITER kernel accesses: w1[6], w2[6] for local expert 6            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ✅ expert_map handles conversion - NO manual offset adjustment needed!     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                        MORI-EP EXPERT PARALLELISM FLOW                          │
@@ -146,21 +193,36 @@ Input: hidden_states [M, H]  (M tokens, H=7168 hidden dim)
 │              _receiver() [mori_prepare_finalize.py:242-315]                  │
 │                                                                              │
 │  # Unpack dispatch result                                                    │
-│  recv_x = dispatch_result[0]           # [N_recv, H] tokens received        │
-│  recv_weights = dispatch_result[1]     # [N_recv, K] weights                │
-│  recv_scale = dispatch_result[2]       # [N_recv, scale_dim] or None        │
-│  recv_topk_ids = dispatch_result[3]    # [N_recv, K] LOCAL expert IDs       │
+│  recv_x_full = dispatch_result[0]      # [MAX_RECV, H] FIXED SIZE buffer   │
+│  recv_weights_full = dispatch_result[1]# [MAX_RECV, K] weights             │
+│  recv_scale_full = dispatch_result[2]  # [MAX_RECV, scale_dim] or None     │
+│  recv_topk_ids = dispatch_result[3]    # [MAX_RECV, K] GLOBAL expert IDs   │
+│  total_recv_tokens = dispatch_result[4]# Scalar: actual valid token count  │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │ Expert ID remapping (global → local for expert_map)                    │  │
+│  │ ⚠️ CRITICAL: Slice to valid tokens only!                               │  │
 │  │                                                                        │  │
-│  │ MORI returns LOCAL expert IDs (0 to num_local_experts-1)               │  │
-│  │ We need GLOBAL for expert_map compatibility                            │  │
+│  │ MORI returns FIXED-SIZE buffers [max_num_tokens, ...]                  │  │
+│  │ Only positions 0..total_recv_tokens-1 contain valid data!              │  │
 │  │                                                                        │  │
-│  │ expert_topk_ids = recv_topk_ids + rank_expert_offset                   │  │
-│  │ Handle -1 (invalid) entries:                                           │  │
-│  │   - For rank 0: set -1 to (num_experts - 1)                           │  │
-│  │   - For other ranks: set -1 to 0                                       │  │
+│  │ num_valid = total_recv_tokens.item()                                   │  │
+│  │ recv_x = recv_x_full[:num_valid]                                       │  │
+│  │ recv_weights = recv_weights_full[:num_valid]                           │  │
+│  │ recv_topk_ids = recv_topk_ids[:num_valid]                              │  │
+│  │                                                                        │  │
+│  │ NOTE: .item() breaks CUDA graph capture! Use --enforce-eager for now   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ ✅ Expert IDs: Keep GLOBAL, pass to AITER unchanged                    │  │
+│  │                                                                        │  │
+│  │ MORI dispatch returns the ORIGINAL global expert IDs (0-255)           │  │
+│  │ from the router. It just copies tokenIndices to shmemOutIndices.       │  │
+│  │                                                                        │  │
+│  │ expert_topk_ids = recv_topk_ids  # Keep as-is! (GLOBAL IDs)            │  │
+│  │                                                                        │  │
+│  │ AITER expects GLOBAL IDs when expert_map is provided:                  │  │
+│  │   expert_map[global_id] → local_id (or -1 if not on this rank)         │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
@@ -439,16 +501,17 @@ Input: hidden_states [M, H]  (M tokens, H=7168 hidden dim)
    
    ⚠️  call_reset=True might force synchronization!
 
-5. EXPERT ID REMAPPING OVERHEAD
+5. ✅ EXPERT ID HANDLING (FIXED Jan 2026)
    ─────────────────────────────────────────────────────────────────────────────
-   In _receiver():
-      expert_topk_ids = torch.where(
-          recv_topk_ids == -1,
-          num_experts - 1 if self.rank_expert_offset == 0 else 0,
-          recv_topk_ids.to(torch.int64) + self.rank_expert_offset,
-      )
+   Previous BUG: We were ADDING rank_expert_offset to global IDs!
    
-   This torch.where runs on every batch, creating intermediate tensors.
+      expert_topk_ids = recv_topk_ids + rank_expert_offset  # ❌ WRONG!
+      # Global ID 70 on rank 2 → 70 + 64 = 134 (out of range!)
+   
+   FIX: MORI returns GLOBAL IDs (same as router output). Pass unchanged:
+   
+      expert_topk_ids = recv_topk_ids  # ✅ Keep global IDs (0-255)
+      # AITER uses expert_map[70] → 6 (local) internally
    
 6. QUANTIZATION STRATEGY
    ─────────────────────────────────────────────────────────────────────────────
@@ -556,26 +619,45 @@ combine_result = self.ep_op.combine(
 )
 ```
 
-### 3. ⚠️ EXPERT ID REMAPPING OVERHEAD
+### 3. ✅ EXPERT ID BUG FIXED
 
 ```python
-# In _receiver() - runs on EVERY forward pass:
-expert_topk_ids = torch.where(
-    recv_topk_ids == -1,
-    num_experts - 1 if self.rank_expert_offset == 0 else 0,
-    recv_topk_ids.to(torch.int64) + self.rank_expert_offset,
-)
+# BEFORE (WRONG):
+expert_topk_ids = recv_topk_ids + self.rank_expert_offset  # ❌ 70 → 134
+
+# AFTER (CORRECT):
+expert_topk_ids = recv_topk_ids  # ✅ Keep global IDs unchanged
 ```
 
-This creates intermediate tensors on every batch. Could pre-allocate.
+MORI's C++ dispatch copies original tokenIndices to output unchanged:
+```cpp
+// intranode.hpp line 135-137:
+args.shmemOutIndicesMemObj[...] = args.tokenIndices[...]  // Original global IDs!
+```
 
-### 4. ⚠️ CUDA GRAPH COMPATIBILITY
+AITER expects global IDs when expert_map is provided:
+- expert_map[global_id] → local_id (or -1 if not on this rank)
+- NO modification needed in our code!
 
-MORI returns fixed-size buffers:
-- dispatch returns: [max_num_tokens, hidden_dim] = [8192, 7168]
-- combine returns: [max_num_tokens, hidden_dim] = [8192, 7168]
+### 4. ⚠️ CUDA GRAPH COMPATIBILITY & BUFFER SLICING
 
-For small batches, this wastes compute and memory bandwidth.
+MORI returns FIXED-SIZE buffers:
+- dispatch returns: [8192, 7168] but only [0:N_valid] has real data!
+- combine returns: [8192, 7168] (fixed)
+
+**Critical Bug Found**: Without slicing, expert kernels compute on garbage data!
+
+```python
+# BEFORE (WRONG): Pass full 8192 tokens (most are garbage)
+expert_x = recv_x_full  # [8192, H] - positions N+1..8191 are uninitialized!
+
+# AFTER (CORRECT): Slice to valid tokens only
+num_valid = total_recv_tokens.item()  # e.g., 512
+expert_x = recv_x_full[:num_valid]    # [512, H] - only real data
+```
+
+**Trade-off**: Using `.item()` breaks CUDA graph capture. Must use `--enforce-eager`.
+For CUDA graph support, need kernel-level masking or pre-registered buffers.
 
 ### 5. 🔴 POTENTIAL ROOT CAUSE: Strategy B (BF16 dispatch)
 
@@ -606,40 +688,53 @@ For 70k input tokens:
 
 ---
 
-## Recommended Fixes
+## Implemented Fixes (Jan 2026)
+
+### ✅ Fix 1: Expert ID Handling (CRITICAL - was causing garbage output!)
+```python
+# BEFORE (WRONG):
+expert_topk_ids = recv_topk_ids + self.rank_expert_offset  # 70 → 134 ❌
+
+# AFTER (CORRECT):
+expert_topk_ids = recv_topk_ids  # 70 stays 70, expert_map handles conversion ✅
+```
+
+### ✅ Fix 2: Slice Dispatch Buffer to Valid Tokens
+```python
+# BEFORE (WRONG): Used full 8192-token buffer (garbage data!)
+expert_x = recv_x_full  # [8192, H] includes uninitialized garbage
+
+# AFTER (CORRECT): Slice to actual received tokens
+num_valid = total_recv_tokens.item()
+expert_x = recv_x_full[:num_valid]  # [N_valid, H] only real data
+```
+
+### ✅ Fix 3: Don't Pass Weights to MORI Combine
+```python
+# BEFORE: Unnecessary weight transfer
+combine_result = self.ep_op.combine(..., weights=topk_weights, ...)
+
+# AFTER: AITER already applied weights
+combine_result = self.ep_op.combine(..., weights=None, ...)
+```
+
+### ⚠️ Known Limitation: CUDA Graphs
+The `.item()` call in buffer slicing breaks CUDA graph capture.
+Must use `--enforce-eager` until kernel-level masking is implemented.
+
+---
+
+## Remaining Optimizations (Future Work)
 
 ### Priority 1: Enable FP8 Dispatch
 ```bash
 export VLLM_MORI_EP_USE_FP8_DISPATCH=1
 ```
-Expected: ~2x bandwidth reduction for dispatch
+Expected: ~2x bandwidth reduction for dispatch (1 byte vs 2 bytes)
 
-### Priority 2: Don't Pass Weights to MORI Combine
-```python
-# mori_prepare_finalize.py: _finalize_impl
-combine_result = self.ep_op.combine(
-    input=fused_expert_output,
-    weights=None,  # Remove unnecessary weight transfer
-    indices=topk_ids.to(torch.int32),
-    call_reset=True,
-)
-```
-Expected: Reduce MORI overhead
-
-### Priority 3: Pre-allocate Expert ID Buffer
-```python
-# In __init__:
-self._expert_topk_ids_buffer = None
-
-# In _receiver():
-if self._expert_topk_ids_buffer is None or ...:
-    self._expert_topk_ids_buffer = torch.empty_like(recv_topk_ids, dtype=torch.int64)
-# Reuse buffer instead of creating new tensor
-```
-
-### Priority 4: Check if CUDA Graphs Help
-MORI fixed-size buffers suggest it's designed for CUDA graphs.
-Verify CUDA graphs are being used in decode phase.
+### Priority 2: CUDA Graph Support
+Need kernel-level support for `num_valid_tokens` parameter to avoid `.item()`.
+Or use pre-registered fixed-size buffers with masking in AITER kernel.
 
 ---
 
