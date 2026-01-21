@@ -311,24 +311,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 if recv_topk_ids is not None:
                     recv_topk_ids = recv_topk_ids[:num_valid]
 
-        # Expert ID remapping: Convert MORI's local IDs back to global space
-        # MORI returns local expert IDs, we need global for expert_map compatibility
+        # Expert ID handling: Keep GLOBAL IDs for AITER
+        # MORI dispatch returns the ORIGINAL global expert IDs (0-255).
+        # AITER expects GLOBAL IDs when expert_map is provided:
+        #   - expert_map[global_id] -> local_id (or -1 if not on this rank)
+        #   - AITER uses this internally to route to correct local expert
         #
-        # The existing MOE kernels assume that all entries of topk_ids are valid.
-        # Set -1s to an expert outside this rank so expert_map can remap to -1.
-        # With EP, experts are divided sequentially:
-        # - For rank 0: set -1 to (num_experts - 1)
-        # - For other ranks: set -1 to 0
-        # This ensures expert_map will have -1 in those regions for those ranks.
-        if recv_topk_ids is not None:
-            expert_topk_ids = torch.where(
-                recv_topk_ids == -1,
-                num_experts - 1 if self.rank_expert_offset == 0 else 0,
-                recv_topk_ids.to(torch.int64) + self.rank_expert_offset,
-            )
-        else:
-            # Fallback if MORI doesn't return topk_ids
-            expert_topk_ids = None
+        # DO NOT modify recv_topk_ids! Pass global IDs directly to AITER.
+        expert_topk_ids = recv_topk_ids
 
         # Strategy B: BF16 dispatch, quantize after receive
         # MORI kernels support block-quantized dispatch (Strategy A)
