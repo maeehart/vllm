@@ -327,10 +327,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Debug: print shapes and values
             import os
             if os.environ.get("VLLM_MORI_DEBUG"):
-                print(f"[MORI DEBUG] rank={self.ep_rank}, recv_topk_ids shape={recv_topk_ids.shape}")
-                print(f"[MORI DEBUG] recv_topk_ids[:3]={recv_topk_ids[:3].tolist() if recv_topk_ids.numel() > 0 else 'empty'}")
+                ep_rank = self.rank_expert_offset // self.num_local_experts
+                print(f"[MORI DEBUG] ep_rank={ep_rank}, recv_topk_ids shape={recv_topk_ids.shape}")
+                if recv_topk_ids.numel() > 0:
+                    print(f"[MORI DEBUG] recv_topk_ids[:3]={recv_topk_ids[:3].tolist()}")
                 print(f"[MORI DEBUG] num_valid={num_valid if 'num_valid' in dir() else 'N/A'}")
-                print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}")
+                print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}, num_local_experts={self.num_local_experts}")
             
             # Convert global to local by subtracting offset
             expert_topk_ids = recv_topk_ids.to(torch.int64) - self.rank_expert_offset
