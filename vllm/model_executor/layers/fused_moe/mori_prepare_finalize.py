@@ -230,7 +230,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if os.environ.get("VLLM_MORI_DEBUG"):
             ep_rank = self.rank_expert_offset // self.num_local_experts
             print(f"[MORI DISPATCH DEBUG] ep_rank={ep_rank}, "
-                  f"tokens shape={tokens.shape}, topk_ids shape={topk_ids.shape}")
+                  f"tokens shape={tokens.shape}, topk_ids shape={topk_ids.shape}, "
+                  f"tokens mean={tokens.float().mean().item():.4f}")
         
         dispatch_result = self.ep_op.dispatch(
             input=tokens,
@@ -670,6 +671,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Clear dispatch metadata for this ubatch
         self._dispatch_metadata[ubatch_idx] = {}
 
+        # DEBUG: Add sync before copy to ensure combine is finished
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            torch.cuda.synchronize()
+            print(f"[MORI FINAL DEBUG] After sync, combined_x[:1] mean={combined_x[:1].float().mean().item():.4f}")
+
         if do_async:
             def _receiver():
                 # Respect inplace outputs
@@ -677,8 +683,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             return _receiver
         else:
-            # Synchronous: copy immediately
+            # Synchronous: copy immediately  
             output.copy_(combined_x, non_blocking=True)
+            
+            # DEBUG: Check output after copy
+            if os.environ.get("VLLM_MORI_DEBUG"):
+                torch.cuda.synchronize()
+                print(f"[MORI FINAL DEBUG] output after copy mean={output.float().mean().item():.4f}")
             return None
 
     def finalize_async(
