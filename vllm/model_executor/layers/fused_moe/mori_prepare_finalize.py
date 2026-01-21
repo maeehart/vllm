@@ -293,25 +293,23 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_x = recv_x
             expert_x_scale = None
 
-        # NOTE on MORI buffer padding:
-        # MORI returns fixed-size buffers [max_num_tokens, ...] with valid data
-        # only in positions 0..total_recv_tokens-1. Positions beyond that contain
-        # uninitialized data.
+        # CRITICAL: Slice buffers to only valid tokens!
+        # MORI returns fixed-size buffers [max_num_tokens, ...] but only
+        # positions 0..total_recv_tokens-1 contain valid data.
+        # Passing garbage data to expert computation corrupts output.
         #
-        # We initially tried to mask invalid positions by setting them to -1,
-        # but this requires memory allocation which breaks CUDA graph capture.
-        #
-        # [TRIED] Masking with torch.where/torch.arange - breaks CUDA graph capture
-        #         because tensor allocation is not allowed during capture
-        #
-        # The current approach: Trust that MORI's combine operation correctly
-        # tracks which positions were actually dispatched. Invalid positions
-        # may go through expert computation with garbage IDs, but their results
-        # should NOT affect valid output positions because MORI combine only
-        # routes back results for tokens it actually dispatched.
-        #
-        # If this causes correctness issues, we need to investigate MORI's
-        # internal handling of the dispatch/combine indices.
+        # NOTE: This uses .item() which breaks CUDA graph capture.
+        # For CUDA graph support, we'll need a different approach.
+        if total_recv_tokens is not None:
+            num_valid = int(total_recv_tokens.item())
+            if num_valid < expert_x.shape[0]:
+                expert_x = expert_x[:num_valid]
+                if expert_x_scale is not None:
+                    expert_x_scale = expert_x_scale[:num_valid]
+                if recv_weights is not None:
+                    recv_weights = recv_weights[:num_valid]
+                if recv_topk_ids is not None:
+                    recv_topk_ids = recv_topk_ids[:num_valid]
 
         # Expert ID remapping: Convert MORI's local IDs back to global space
         # MORI returns local expert IDs, we need global for expert_map compatibility
