@@ -473,9 +473,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # MORI combine - returns results to original token owners
         # combine(input, weights, indices, block_num, warp_per_block, call_reset)
         # Returns: (output, output_scale)
+        #
+        # NOTE: We pass weights=None because AITER fused_moe already applies
+        # topk_weights during expert computation. Passing weights here would
+        # cause MORI to accumulate them unnecessarily (wasted bandwidth).
         combine_result = self.ep_op.combine(
             input=fused_expert_output,
-            weights=topk_weights if not apply_router_weight_on_input else None,
+            weights=None,  # AITER already applied weights
             indices=topk_ids.to(torch.int32),
             call_reset=True,  # Reset for next iteration
         )

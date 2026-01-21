@@ -222,7 +222,7 @@ def make_unquantized_moe_kernel(
                 ),
                 AiterExperts(quant_config),
                 moe_parallel_config=moe_config.moe_parallel_config,
-            )
+        )
     elif backend == UnquantizedMoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe import TritonExperts
 
