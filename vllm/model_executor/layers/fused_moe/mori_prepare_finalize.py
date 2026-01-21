@@ -147,6 +147,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Store dispatch metadata for combine
         self._dispatch_metadata: list[dict[str, Any]] = [{}, {}]
+        
+        # Deduplication state (set during _receiver, used during _finalize_impl)
+        self._dedup_inverse_indices: torch.Tensor | None = None
+        self._dedup_num_unique: int | None = None
 
         logger.info(
             "Initialized MoriPrepareAndFinalize: "
@@ -300,6 +304,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         #
         # NOTE: This uses .item() which breaks CUDA graph capture.
         # For CUDA graph support, we'll need a different approach.
+        num_valid = None
         if total_recv_tokens is not None:
             num_valid = int(total_recv_tokens.item())
             if num_valid < expert_x.shape[0]:
@@ -310,6 +315,50 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     recv_weights = recv_weights[:num_valid]
                 if recv_topk_ids is not None:
                     recv_topk_ids = recv_topk_ids[:num_valid]
+        
+        # CRITICAL FIX: Deduplicate received entries by source token!
+        #
+        # MORI dispatches per (token, expert) pair - so if token T has 2 local
+        # experts, rank R receives 2 entries for T (both with same topk_ids).
+        # If we process each entry with AITER, each entry computes ALL local
+        # experts, causing 2x over-computation and garbage output.
+        #
+        # Solution: Keep only unique tokens, process once, then expand for combine.
+        src_token_pos = self.ep_op.get_dispatch_src_token_pos()
+        if src_token_pos is not None and src_token_pos.numel() > 0:
+            # Find unique source positions and their indices
+            unique_pos, inverse_indices = torch.unique(
+                src_token_pos, return_inverse=True
+            )
+            num_unique = unique_pos.numel()
+            
+            import os
+            if os.environ.get("VLLM_MORI_DEBUG"):
+                ep_rank = self.rank_expert_offset // self.num_local_experts
+                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, unique_tokens={num_unique}")
+            
+            # Get indices of first occurrence of each unique token
+            # (arange creates indices 0..N-1, then scatter_min finds first occurrence)
+            first_indices = torch.empty(num_unique, dtype=torch.long, device=src_token_pos.device)
+            first_indices.fill_(src_token_pos.numel())  # Initialize with max
+            arange = torch.arange(src_token_pos.numel(), device=src_token_pos.device)
+            first_indices.scatter_reduce_(0, inverse_indices, arange, reduce='amin')
+            
+            # Keep only first occurrence of each unique token
+            expert_x = expert_x[first_indices]
+            if expert_x_scale is not None:
+                expert_x_scale = expert_x_scale[first_indices]
+            if recv_weights is not None:
+                recv_weights = recv_weights[first_indices]
+            if recv_topk_ids is not None:
+                recv_topk_ids = recv_topk_ids[first_indices]
+            
+            # Store info needed to expand results back for combine
+            self._dedup_inverse_indices = inverse_indices
+            self._dedup_num_unique = num_unique
+        else:
+            self._dedup_inverse_indices = None
+            self._dedup_num_unique = None
 
         # Expert ID handling: Convert GLOBAL IDs to LOCAL IDs
         #
@@ -534,6 +583,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 topk_ids=topk_ids,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
+            
+            # CRITICAL: Expand deduplicated results back to full size for combine
+            # We processed unique tokens only, but combine expects one result per
+            # dispatched entry (including duplicates).
+            if self._dedup_inverse_indices is not None:
+                import os
+                if os.environ.get("VLLM_MORI_DEBUG"):
+                    print(f"[MORI EXPAND] Expanding {fused_expert_output.shape[0]} -> {self._dedup_inverse_indices.numel()}")
+                fused_expert_output = fused_expert_output[self._dedup_inverse_indices]
 
         # MORI combine expects BF16
         assert fused_expert_output.dtype == torch.bfloat16, (
