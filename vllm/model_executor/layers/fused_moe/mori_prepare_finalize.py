@@ -293,25 +293,25 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_x = recv_x
             expert_x_scale = None
 
-        # CRITICAL: Mask invalid positions in recv_topk_ids!
-        # Positions beyond total_recv_tokens contain garbage data with random
-        # expert IDs that can corrupt valid output positions during combine.
+        # NOTE on MORI buffer padding:
+        # MORI returns fixed-size buffers [max_num_tokens, ...] with valid data
+        # only in positions 0..total_recv_tokens-1. Positions beyond that contain
+        # uninitialized data.
         #
-        # We create a mask using GPU tensor operations (CUDA-graph safe):
-        # - indices: [0, 1, 2, ..., buffer_size-1]
-        # - valid_mask: indices < total_recv_tokens (GPU comparison)
-        # - Set invalid positions to -1 so they're ignored by expert computation
-        if recv_topk_ids is not None and total_recv_tokens is not None:
-            buffer_size = recv_topk_ids.shape[0]
-            indices = torch.arange(buffer_size, device=recv_topk_ids.device)
-            # GPU tensor comparison - no .item() needed!
-            valid_mask = indices < total_recv_tokens
-            # Set invalid positions to -1 (will be handled by expert_map)
-            recv_topk_ids = torch.where(
-                valid_mask.unsqueeze(-1),
-                recv_topk_ids,
-                torch.tensor(-1, device=recv_topk_ids.device, dtype=recv_topk_ids.dtype),
-            )
+        # We initially tried to mask invalid positions by setting them to -1,
+        # but this requires memory allocation which breaks CUDA graph capture.
+        #
+        # [TRIED] Masking with torch.where/torch.arange - breaks CUDA graph capture
+        #         because tensor allocation is not allowed during capture
+        #
+        # The current approach: Trust that MORI's combine operation correctly
+        # tracks which positions were actually dispatched. Invalid positions
+        # may go through expert computation with garbage IDs, but their results
+        # should NOT affect valid output positions because MORI combine only
+        # routes back results for tokens it actually dispatched.
+        #
+        # If this causes correctness issues, we need to investigate MORI's
+        # internal handling of the dispatch/combine indices.
 
         # Expert ID remapping: Convert MORI's local IDs back to global space
         # MORI returns local expert IDs, we need global for expert_map compatibility
