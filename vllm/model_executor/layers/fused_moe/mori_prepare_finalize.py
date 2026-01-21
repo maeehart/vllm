@@ -620,8 +620,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # 2. Know what results THIS rank expects to receive
         # - fused_expert_output: [N_recv, H] - expert outputs for received tokens
         # - original_topk_ids: [M, K] - THIS rank's original tokens' expert choices
+        #
+        # CRITICAL FIX: Copy to registered shmem buffer before combine!
+        # MORI's combine kernel uses shared memory for inter-GPU communication.
+        # The input must be in the registered buffer for other ranks to access.
+        combine_input_buffer = self.ep_op.get_registered_combine_input_buffer(
+            fused_expert_output.dtype
+        )
+        num_recv = fused_expert_output.shape[0]
+        if num_recv > 0:
+            combine_input_buffer[:num_recv].copy_(fused_expert_output)
+        
         combine_result = self.ep_op.combine(
-            input=fused_expert_output,
+            input=combine_input_buffer[:num_recv] if num_recv > 0 else fused_expert_output,
             weights=None,  # AITER already applied weights
             indices=original_topk_ids.to(torch.int32),
             call_reset=True,  # Reset for next iteration
