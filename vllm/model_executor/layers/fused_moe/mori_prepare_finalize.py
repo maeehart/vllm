@@ -430,6 +430,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # )
         expert_tokens_meta = None
 
+        # DEBUG: show recv_weights info
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            if recv_weights is not None:
+                print(f"[MORI RECEIVER DEBUG] recv_weights shape={recv_weights.shape}, "
+                      f"sum={recv_weights.sum().item():.4f}")
+            else:
+                print(f"[MORI RECEIVER DEBUG] recv_weights is None!")
+
         return (
             expert_x,
             expert_x_scale,
@@ -588,6 +596,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
         if fused_expert_output.numel() != 0:
+            # DEBUG: Check shapes before weight_and_reduce
+            if os.environ.get("VLLM_MORI_DEBUG"):
+                print(f"[MORI WEIGHT_REDUCE DEBUG] fused_expert_output shape={fused_expert_output.shape}, "
+                      f"topk_weights shape={topk_weights.shape}, topk_ids shape={topk_ids.shape}")
+            
             # Apply weights before combine if using delegate
             if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
                 weight_and_reduce_impl = TopKWeightAndReduceContiguous()
