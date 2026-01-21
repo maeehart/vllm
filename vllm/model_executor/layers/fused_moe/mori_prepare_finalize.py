@@ -151,6 +151,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Deduplication state (set during _receiver, used during _finalize_impl)
         self._dedup_inverse_indices: torch.Tensor | None = None
         self._dedup_num_unique: int | None = None
+        self._dedup_original_count: int | None = None
 
         logger.info(
             "Initialized MoriPrepareAndFinalize: "
@@ -325,61 +326,72 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         
         # CRITICAL FIX: Deduplicate received entries by source token!
         #
-        # MORI dispatches per (token, expert) pair - so if token T has 2 local
-        # experts, rank R receives 2 entries for T (both with same topk_ids).
-        # If we process each entry with AITER, each entry computes ALL local
-        # experts, causing 2x over-computation and garbage output.
+        # With TP=8, all 8 ranks process the SAME token with identical routing.
+        # Each rank dispatches to expert owners, so rank R receives the same
+        # token 8 times from 8 different source ranks!
         #
-        # Solution: Keep only unique tokens, process once, then expand for combine.
+        # MORI's src_token_pos is a BUFFER OFFSET (rank × 8192), NOT token ID.
+        # So we deduplicate by topk_ids pattern instead - identical topk_ids 
+        # means identical source token.
+        #
+        # Solution: Keep only unique topk_id patterns, process once with AITER,
+        # then replicate results for combine.
+        import os
+        
         src_token_pos = self.ep_op.get_dispatch_src_token_pos()
         
-        import os
         if os.environ.get("VLLM_MORI_DEBUG") and src_token_pos is not None:
             ep_rank = self.rank_expert_offset // self.num_local_experts
-            # CRITICAL DEBUG: Understand what src_token_pos contains!
             print(f"[MORI SRC_POS DEBUG] ep_rank={ep_rank}")
             print(f"[MORI SRC_POS DEBUG] src_token_pos shape={src_token_pos.shape}, dtype={src_token_pos.dtype}")
             if src_token_pos.numel() > 0 and src_token_pos.numel() <= 16:
                 print(f"[MORI SRC_POS DEBUG] src_token_pos={src_token_pos.tolist()}")
-            elif src_token_pos.numel() > 16:
-                print(f"[MORI SRC_POS DEBUG] src_token_pos[:16]={src_token_pos[:16].tolist()}")
             if src_token_pos.numel() > 0:
                 print(f"[MORI SRC_POS DEBUG] min={src_token_pos.min().item()}, max={src_token_pos.max().item()}")
         
-        if src_token_pos is not None and src_token_pos.numel() > 0:
-            # Find unique source positions and their indices
-            unique_pos, inverse_indices = torch.unique(
-                src_token_pos, return_inverse=True
+        # Deduplicate by topk_ids pattern (not src_token_pos which is buffer offset)
+        if recv_topk_ids is not None and recv_topk_ids.numel() > 0 and recv_topk_ids.shape[0] > 1:
+            # Find unique topk_id patterns
+            unique_patterns, inverse_indices = torch.unique(
+                recv_topk_ids, dim=0, return_inverse=True
             )
-            num_unique = unique_pos.numel()
+            num_unique = unique_patterns.shape[0]
             
             if os.environ.get("VLLM_MORI_DEBUG"):
                 ep_rank = self.rank_expert_offset // self.num_local_experts
-                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, unique_tokens={num_unique}")
-                print(f"[MORI DEDUP] unique_pos={unique_pos.tolist()}")
+                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, unique_patterns={num_unique}")
             
-            # Get indices of first occurrence of each unique token
-            # (arange creates indices 0..N-1, then scatter_min finds first occurrence)
-            first_indices = torch.empty(num_unique, dtype=torch.long, device=src_token_pos.device)
-            first_indices.fill_(src_token_pos.numel())  # Initialize with max
-            arange = torch.arange(src_token_pos.numel(), device=src_token_pos.device)
-            first_indices.scatter_reduce_(0, inverse_indices, arange, reduce='amin')
-            
-            # Keep only first occurrence of each unique token
-            expert_x = expert_x[first_indices]
-            if expert_x_scale is not None:
-                expert_x_scale = expert_x_scale[first_indices]
-            if recv_weights is not None:
-                recv_weights = recv_weights[first_indices]
-            if recv_topk_ids is not None:
-                recv_topk_ids = recv_topk_ids[first_indices]
-            
-            # Store info needed to expand results back for combine
-            self._dedup_inverse_indices = inverse_indices
-            self._dedup_num_unique = num_unique
+            if num_unique < recv_topk_ids.shape[0]:
+                # Get indices of first occurrence of each unique pattern
+                first_indices = torch.empty(num_unique, dtype=torch.long, device=recv_topk_ids.device)
+                first_indices.fill_(recv_topk_ids.shape[0])  # Initialize with max
+                arange = torch.arange(recv_topk_ids.shape[0], device=recv_topk_ids.device)
+                first_indices.scatter_reduce_(0, inverse_indices, arange, reduce='amin')
+                
+                if os.environ.get("VLLM_MORI_DEBUG"):
+                    print(f"[MORI DEDUP] Reducing {recv_topk_ids.shape[0]} entries to {num_unique} unique")
+                    print(f"[MORI DEDUP] first_indices={first_indices.tolist()}")
+                
+                # Keep only first occurrence of each unique pattern
+                expert_x = expert_x[first_indices]
+                if expert_x_scale is not None:
+                    expert_x_scale = expert_x_scale[first_indices]
+                if recv_weights is not None:
+                    recv_weights = recv_weights[first_indices]
+                recv_topk_ids = unique_patterns  # Use the unique patterns directly
+                
+                # Store info needed to expand results back for combine
+                self._dedup_inverse_indices = inverse_indices
+                self._dedup_num_unique = num_unique
+                self._dedup_original_count = num_valid
+            else:
+                self._dedup_inverse_indices = None
+                self._dedup_num_unique = None
+                self._dedup_original_count = None
         else:
             self._dedup_inverse_indices = None
             self._dedup_num_unique = None
+            self._dedup_original_count = None
 
         # Expert ID handling: Convert GLOBAL IDs to LOCAL IDs
         #
