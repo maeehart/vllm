@@ -343,6 +343,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Debug: Show expert_x shape to understand received data
             if os.environ.get("VLLM_MORI_DEBUG"):
                 print(f"[MORI DEBUG] expert_x shape after slice={expert_x.shape}")
+                # Check a sample of topk_ids to see local expert coverage
+                if recv_topk_ids.numel() > 0:
+                    sample_ids = recv_topk_ids[0].tolist()
+                    local_experts = [eid for eid in sample_ids 
+                                     if self.rank_expert_offset <= eid < self.rank_expert_offset + self.num_local_experts]
+                    print(f"[MORI DEBUG] Sample topk_ids={sample_ids}, local_experts={local_experts}")
         else:
             expert_topk_ids = None
 
