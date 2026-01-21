@@ -561,13 +561,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_meta = self._dispatch_metadata[ubatch_idx]
         original_topk_ids = dispatch_meta.get("original_topk_ids", topk_ids)
         
-        # Debug: print shapes to understand the data flow
+        # Debug: print shapes AND VALUES to understand the data flow
         import os
         if os.environ.get("VLLM_MORI_DEBUG"):
+            ep_rank = self.rank_expert_offset // self.num_local_experts
+            print(f"[MORI COMBINE DEBUG] ep_rank={ep_rank}")
             print(f"[MORI COMBINE DEBUG] fused_expert_output shape={fused_expert_output.shape}")
             print(f"[MORI COMBINE DEBUG] original_topk_ids shape={original_topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] topk_ids (received) shape={topk_ids.shape}")
             print(f"[MORI COMBINE DEBUG] output shape={output.shape}")
+            # Check for NaN/zero issues
+            if fused_expert_output.numel() > 0:
+                print(f"[MORI COMBINE DEBUG] fused_expert_output: "
+                      f"mean={fused_expert_output.float().mean().item():.4f}, "
+                      f"std={fused_expert_output.float().std().item():.4f}, "
+                      f"nan_count={torch.isnan(fused_expert_output).sum().item()}, "
+                      f"zero_rows={(fused_expert_output.abs().sum(dim=1) == 0).sum().item()}")
 
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
@@ -619,6 +628,17 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         combined_x = combine_result[0]
+
+        # Debug: check combine output values
+        import os
+        if os.environ.get("VLLM_MORI_DEBUG"):
+            print(f"[MORI COMBINE DEBUG] combine_result[0] shape={combined_x.shape}")
+            if combined_x.numel() > 0:
+                print(f"[MORI COMBINE DEBUG] combined_x: "
+                      f"mean={combined_x.float().mean().item():.4f}, "
+                      f"std={combined_x.float().std().item():.4f}, "
+                      f"nan_count={torch.isnan(combined_x).sum().item()}, "
+                      f"zero_rows={(combined_x.abs().sum(dim=1) == 0).sum().item()}")
 
         # MORI combine returns a fixed-size buffer [max_num_tokens, hidden_dim]
         # but the actual batch may be smaller. Slice to match output shape.
