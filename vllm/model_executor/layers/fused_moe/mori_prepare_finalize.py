@@ -499,7 +499,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Retrieve ORIGINAL topk_ids from dispatch metadata
         # CRITICAL: combine needs the ORIGINAL indices [M, 8] to route back
         # to original token owners, NOT the received indices [N_recv, 8]!
-        dispatch_meta = self._dispatch_metadata.get(ubatch_idx, {})
+        dispatch_meta = self._dispatch_metadata[ubatch_idx]
         original_topk_ids = dispatch_meta.get("original_topk_ids", topk_ids)
         original_topk_weights = dispatch_meta.get("original_topk_weights", topk_weights)
 
