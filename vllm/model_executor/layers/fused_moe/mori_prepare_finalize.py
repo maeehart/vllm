@@ -332,6 +332,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         #
         # Solution: Keep only unique tokens, process once, then expand for combine.
         src_token_pos = self.ep_op.get_dispatch_src_token_pos()
+        
+        import os
+        if os.environ.get("VLLM_MORI_DEBUG") and src_token_pos is not None:
+            ep_rank = self.rank_expert_offset // self.num_local_experts
+            # CRITICAL DEBUG: Understand what src_token_pos contains!
+            print(f"[MORI SRC_POS DEBUG] ep_rank={ep_rank}")
+            print(f"[MORI SRC_POS DEBUG] src_token_pos shape={src_token_pos.shape}, dtype={src_token_pos.dtype}")
+            if src_token_pos.numel() > 0 and src_token_pos.numel() <= 16:
+                print(f"[MORI SRC_POS DEBUG] src_token_pos={src_token_pos.tolist()}")
+            elif src_token_pos.numel() > 16:
+                print(f"[MORI SRC_POS DEBUG] src_token_pos[:16]={src_token_pos[:16].tolist()}")
+            if src_token_pos.numel() > 0:
+                print(f"[MORI SRC_POS DEBUG] min={src_token_pos.min().item()}, max={src_token_pos.max().item()}")
+        
         if src_token_pos is not None and src_token_pos.numel() > 0:
             # Find unique source positions and their indices
             unique_pos, inverse_indices = torch.unique(
@@ -339,10 +353,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             )
             num_unique = unique_pos.numel()
             
-            import os
             if os.environ.get("VLLM_MORI_DEBUG"):
                 ep_rank = self.rank_expert_offset // self.num_local_experts
                 print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, unique_tokens={num_unique}")
+                print(f"[MORI DEDUP] unique_pos={unique_pos.tolist()}")
             
             # Get indices of first occurrence of each unique token
             # (arange creates indices 0..N-1, then scatter_min finds first occurrence)
@@ -387,6 +401,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 print(f"[MORI DEBUG] ep_rank={ep_rank}, recv_topk_ids shape={recv_topk_ids.shape}")
                 if recv_topk_ids.numel() > 0:
                     print(f"[MORI DEBUG] recv_topk_ids[:3]={recv_topk_ids[:3].tolist()}")
+                    # Check if all recv_topk_ids rows are identical (sign of per-expert dispatch)
+                    if recv_topk_ids.shape[0] > 1:
+                        all_same = torch.all(recv_topk_ids == recv_topk_ids[0:1]).item()
+                        print(f"[MORI DEBUG] All recv_topk_ids rows identical: {all_same}")
+                        if not all_same:
+                            num_unique_patterns = torch.unique(recv_topk_ids, dim=0).shape[0]
+                            print(f"[MORI DEBUG] Number of unique topk_id patterns: {num_unique_patterns}")
                 print(f"[MORI DEBUG] num_valid={num_valid if 'num_valid' in dir() else 'N/A'}")
                 print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}, num_local_experts={self.num_local_experts}")
             
@@ -430,6 +451,23 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # )
         expert_tokens_meta = None
 
+        # DEBUG: Detailed recv_weights analysis
+        if os.environ.get("VLLM_MORI_DEBUG") and recv_weights is not None and recv_weights.numel() > 0:
+            ep_rank = self.rank_expert_offset // self.num_local_experts
+            print(f"[MORI WEIGHTS DEBUG] ep_rank={ep_rank}")
+            print(f"[MORI WEIGHTS DEBUG] recv_weights shape={recv_weights.shape}")
+            print(f"[MORI WEIGHTS DEBUG] recv_weights sum={recv_weights.sum().item():.4f}")
+            # Per-row sums to check if weights are per-token normalized
+            row_sums = recv_weights.sum(dim=1)
+            print(f"[MORI WEIGHTS DEBUG] row_sums: min={row_sums.min().item():.4f}, max={row_sums.max().item():.4f}, mean={row_sums.mean().item():.4f}")
+            # Show first few rows
+            if recv_weights.shape[0] <= 8:
+                for i in range(recv_weights.shape[0]):
+                    print(f"[MORI WEIGHTS DEBUG] row[{i}] sum={recv_weights[i].sum().item():.4f}: {recv_weights[i].tolist()}")
+            else:
+                for i in range(3):
+                    print(f"[MORI WEIGHTS DEBUG] row[{i}] sum={recv_weights[i].sum().item():.4f}: {recv_weights[i].tolist()}")
+        
         # DEBUG: show recv_weights info
         if os.environ.get("VLLM_MORI_DEBUG"):
             if recv_weights is not None:
