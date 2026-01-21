@@ -268,6 +268,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         #   (out_tokens, out_weights, out_scales, out_indices, total_recv_token_num)
         #
         # MORI returns FIXED-SIZE buffers [max_num_tokens, ...] (e.g., [8192, 7168])
+        # Only positions 0..total_recv_tokens-1 contain valid data!
         #
         # [TRIED] Slicing with total_recv_tokens.item() - fails during CUDA graph
         #         capture because .item() transfers GPU->CPU
@@ -276,14 +277,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         #         The upper bound can exceed actual_recv_tokens, including
         #         uninitialized buffer data in expert computation.
         #
-        # CORRECT APPROACH: Use full buffer. The extra compute on padding is
-        # wasteful but the padding doesn't affect the final output because
-        # MORI combine only returns results for valid token positions.
+        # SOLUTION: Use GPU tensor masking! We can compare indices to
+        # total_recv_tokens (a GPU scalar tensor) without .item().
+        # This is CUDA-graph safe because all operations stay on GPU.
         recv_x = dispatch_result[0]
         recv_weights = dispatch_result[1] if len(dispatch_result) > 1 else None
         recv_scale = dispatch_result[2] if len(dispatch_result) > 2 else None
         recv_topk_ids = dispatch_result[3] if len(dispatch_result) > 3 else None
-        # total_recv_tokens = dispatch_result[4]  # Actual count, can't use during graph capture
+        total_recv_tokens = dispatch_result[4] if len(dispatch_result) > 4 else None
 
         if has_scales:
             expert_x = recv_x
@@ -291,6 +292,26 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         else:
             expert_x = recv_x
             expert_x_scale = None
+
+        # CRITICAL: Mask invalid positions in recv_topk_ids!
+        # Positions beyond total_recv_tokens contain garbage data with random
+        # expert IDs that can corrupt valid output positions during combine.
+        #
+        # We create a mask using GPU tensor operations (CUDA-graph safe):
+        # - indices: [0, 1, 2, ..., buffer_size-1]
+        # - valid_mask: indices < total_recv_tokens (GPU comparison)
+        # - Set invalid positions to -1 so they're ignored by expert computation
+        if recv_topk_ids is not None and total_recv_tokens is not None:
+            buffer_size = recv_topk_ids.shape[0]
+            indices = torch.arange(buffer_size, device=recv_topk_ids.device)
+            # GPU tensor comparison - no .item() needed!
+            valid_mask = indices < total_recv_tokens
+            # Set invalid positions to -1 (will be handled by expert_map)
+            recv_topk_ids = torch.where(
+                valid_mask.unsqueeze(-1),
+                recv_topk_ids,
+                torch.tensor(-1, device=recv_topk_ids.device, dtype=recv_topk_ids.dtype),
+            )
 
         # Expert ID remapping: Convert MORI's local IDs back to global space
         # MORI returns local expert IDs, we need global for expert_map compatibility
