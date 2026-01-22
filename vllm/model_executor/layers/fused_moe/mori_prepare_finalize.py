@@ -397,97 +397,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             if src_token_pos.numel() > 0:
                 print(f"[MORI SRC_POS DEBUG] min={src_token_pos.min().item()}, max={src_token_pos.max().item()}")
         
-        # Deduplicate by LOCAL TOKEN INDEX to handle TP + EP correctly
-        # src_token_pos = src_rank × max_tokens + local_idx
-        # We dedup by local_idx (same logical token position across TP ranks)
-        if (src_token_pos is not None and 
-            src_token_pos.numel() > 0 and 
-            num_valid is not None and num_valid > 1):
-            # Slice src_token_pos to match the valid token count
-            src_token_pos_valid = src_token_pos[:num_valid]
-            
-            # Compute local_token_idx = src_token_pos % max_tokens_per_rank
-            # We need max_tokens_per_rank - infer from the spacing of positions
-            # In TP mode, consecutive source ranks have positions differing by max_tokens
-            # Alternatively, use the GCD of differences or a known constant
-            #
-            # For safety, we use the value from recv_x shape (max expected tokens)
-            # This works because MORI registers buffers with this size
-            max_tokens_per_rank = expert_x.shape[0]  # Use buffer size as upper bound
-            
-            # But the actual max is configured - let's compute from position spacing
-            # Sort positions and check minimum non-zero difference
-            if src_token_pos_valid.numel() >= 2:
-                sorted_pos, _ = src_token_pos_valid.sort()
-                diffs = sorted_pos[1:] - sorted_pos[:-1]
-                nonzero_diffs = diffs[diffs > 0]
-                if nonzero_diffs.numel() > 0:
-                    # The spacing between consecutive entries from same rank is typically 1
-                    # The spacing between entries from different ranks is max_tokens
-                    # So max_tokens = max(diffs) or a large common factor
-                    # For TP, we just need local_idx consistency
-                    max_diff = diffs.max().item()
-                    if max_diff > 1000:  # Looks like inter-rank spacing
-                        max_tokens_per_rank = max_diff
-                    else:
-                        # Fall back to a reasonable default (8192 is common)
-                        max_tokens_per_rank = 8192
-                else:
-                    max_tokens_per_rank = 8192  # Default
-            else:
-                max_tokens_per_rank = 8192  # Default
-            
-            # Compute local token index for dedup
-            local_token_idx = src_token_pos_valid % max_tokens_per_rank
-            
-            # Find unique local token indices (same local_idx = same logical token)
-            unique_local_idx, inverse_indices = torch.unique(
-                local_token_idx, return_inverse=True
-            )
-            num_unique = unique_local_idx.shape[0]
-            
-            if os.environ.get("VLLM_MORI_DEBUG"):
-                ep_rank = self.rank_expert_offset // self.num_local_experts
-                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, "
-                      f"unique_local_tokens={num_unique}, max_tokens_per_rank={max_tokens_per_rank}")
-                if num_valid <= 16:
-                    print(f"[MORI DEDUP] local_token_idx={local_token_idx.tolist()}")
-            
-            if num_unique < num_valid:
-                # Get indices of first occurrence of each unique local token
-                first_indices = torch.empty(num_unique, dtype=torch.long, device=src_token_pos.device)
-                first_indices.fill_(num_valid)  # Initialize with max
-                arange = torch.arange(num_valid, device=src_token_pos.device)
-                first_indices.scatter_reduce_(0, inverse_indices, arange, reduce='amin')
-                
-                if os.environ.get("VLLM_MORI_DEBUG"):
-                    print(f"[MORI DEDUP] Reducing {num_valid} entries to {num_unique} unique local tokens")
-                    if num_unique <= 16:
-                        print(f"[MORI DEDUP] first_indices={first_indices.tolist()}")
-                
-                # Keep only first occurrence of each unique local token
-                expert_x = expert_x[first_indices]
-                if expert_x_scale is not None:
-                    expert_x_scale = expert_x_scale[first_indices]
-                if recv_weights is not None:
-                    recv_weights = recv_weights[first_indices]
-                if recv_topk_ids is not None:
-                    recv_topk_ids = recv_topk_ids[first_indices]
-                
-                # Store info needed to expand results back for combine
-                self._dedup_inverse_indices = inverse_indices
-                self._dedup_num_unique = num_unique
-                self._dedup_original_count = num_valid
-            else:
-                # All local tokens are unique - no dedup needed
-                self._dedup_inverse_indices = None
-                self._dedup_num_unique = None
-                self._dedup_original_count = None
-        else:
-            # No src_token_pos available or only 1 entry - no dedup
-            self._dedup_inverse_indices = None
-            self._dedup_num_unique = None
-            self._dedup_original_count = None
+        # NOTE: Deduplication was causing output corruption and has been disabled.
+        # Testing shows MORI produces correct output without our dedup logic.
+        # TODO: Investigate if MORI handles dedup internally or if there's wasted compute.
+        self._dedup_inverse_indices = None
+        self._dedup_num_unique = None
+        self._dedup_original_count = None
 
         # TRACE mode: values after dedup
         if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
@@ -849,38 +764,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 if fused_expert_output.numel() > 0:
                     print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
                     print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
-            
-            # MORI combine expects input shape to match RECEIVED count from dispatch,
-            # NOT the original token count. Expand deduplicated results back to 
-            # the received count so MORI can route each result correctly.
-            #
-            # Example: TP=8 decode, we receive 8 entries (from 8 TP ranks), dedup to 1,
-            # compute once, then expand back to 8 for combine.
-            if self._dedup_inverse_indices is not None:
-                if os.environ.get("VLLM_MORI_DEBUG"):
-                    print(f"[MORI EXPAND] Expanding {fused_expert_output.shape[0]} -> {self._dedup_inverse_indices.numel()}")
-                    print(f"[MORI EXPAND] inverse_indices={self._dedup_inverse_indices.tolist()}")
-                
-                # TRACE mode: before expand
-                if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
-                    print(f"\n[TRACE STEP 7: BEFORE EXPAND] ep_rank={ep_rank}")
-                    print(f"  fused_expert_output shape={fused_expert_output.shape}")
-                    print(f"  inverse_indices shape={self._dedup_inverse_indices.shape}")
-                    if self._dedup_inverse_indices.numel() <= 16:
-                        print(f"  inverse_indices={self._dedup_inverse_indices.tolist()}")
-                
-                fused_expert_output = fused_expert_output[self._dedup_inverse_indices]
-                
-                # TRACE mode: after expand
-                if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
-                    print(f"\n[TRACE STEP 8: AFTER EXPAND] ep_rank={ep_rank}")
-                    print(f"  fused_expert_output shape={fused_expert_output.shape}")
-                    if fused_expert_output.numel() > 0:
-                        print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
-                        print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
-                
-                if os.environ.get("VLLM_MORI_DEBUG"):
-                    print(f"[MORI EXPAND] AFTER expand: fused_expert_output shape={fused_expert_output.shape}")
 
         # MORI combine expects BF16
         assert fused_expert_output.dtype == torch.bfloat16, (

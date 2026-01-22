@@ -170,6 +170,13 @@ start_server() {
         SERVER_CMD="$SERVER_CMD --enable-expert-parallel"
         SERVER_CMD="$SERVER_CMD --all2all-backend $BACKEND"
         echo "Mode: Expert Parallel (EP) with $BACKEND"
+        
+        # MORI-EP requires eager mode - CUDA graphs are incompatible with
+        # MORI's inter-GPU collective operations (dispatch/combine)
+        if [[ "$BACKEND" == "mori_ep" ]]; then
+            SERVER_CMD="$SERVER_CMD --enforce-eager"
+            echo "Note: Using --enforce-eager (required for MORI-EP)"
+        fi
     else
         echo "Mode: Basic Tensor Parallel (TP$TP_SIZE, no EP)"
     fi
