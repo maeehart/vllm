@@ -1,0 +1,18 @@
+---
+description: Critical forbidden actions - NEVER do these without explicit permission
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# 🚫 CRITICAL: FORBIDDEN ACTIONS
+
+These actions are NEVER allowed without explicit user permission:
+
+1. **Running benchmarks/servers/training** — Tell user the command, don't run it yourself
+2. **git add -A** or **git add .** — Always use `git add <specific-files>`
+3. **Committing gpucore/core dump files** — Check `git status` first
+4. **pip install without checking** — Run `pip show <pkg>` first
+5. **Reinstalling editable packages** — They persist, ask before reinstalling
+6. **Pushing to upstream** — Only push to YOUR fork
+7. **Retrying failed approaches** — Check [TRIED] comments, try DIFFERENT approach
+8. **Giving up silently** — Always offer alternatives before abandoning

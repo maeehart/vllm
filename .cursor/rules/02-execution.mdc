@@ -1,0 +1,33 @@
+---
+description: Rules for running commands - agent advises, user executes
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# 🖥️ COMMAND EXECUTION: Advise, Don't Run
+
+## Rule: User runs commands, agent advises
+
+For benchmarks, servers, training, or any long-running commands:
+
+✗ WRONG: Agent runs the command directly
+✓ RIGHT: Agent says "Please run this command:" and provides it
+
+## Example
+
+Instead of running:
+```bash
+./benchmark.sh --config test
+```
+
+Say:
+> Please run this command:
+> ```
+> ./benchmark.sh --config test 2>&1 | tee benchmark.log
+> ```
+> Let me know when it completes and I'll analyze the results.
+
+## Why?
+- User sees full output in real-time
+- User maintains control
+- Agent can analyze log file after completion

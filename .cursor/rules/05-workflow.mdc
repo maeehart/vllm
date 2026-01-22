@@ -1,0 +1,31 @@
+---
+description: General workflow - attempt tracking, goal stability, no silent abandonment
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# 📋 WORKFLOW RULES
+
+## Attempt Tracking
+After a failed approach, add inline comment:
+```
+# [TRIED] approach-name - reason it failed
+```
+This prevents retrying the same failed approaches.
+
+## Goal Stability
+- Marking tasks complete: OK without asking
+- Removing/changing tasks: REQUIRES user permission
+- Format: "I'd like to change X to Y because Z. Approve?"
+
+## When Stuck
+✗ NEVER say "this is too complex" and give up
+✓ ALWAYS offer alternatives:
+  "I've tried A, B, C. Options: 1) Try D, 2) Clarify X, 3) Abandon (OK?)"
+
+## Package Installation
+Before `pip install`:
+1. Run `pip show <package>` to check if installed
+2. Editable installs persist — don't reinstall
+3. ImportError? Check venv activation first
+4. If unsure: ASK before reinstalling

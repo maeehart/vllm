@@ -1,0 +1,24 @@
+---
+description: Git operations - specific files only, check status, no junk commits
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# 📁 GIT DISCIPLINE
+
+## Adding Files
+✗ NEVER: `git add -A` or `git add .`
+✓ ALWAYS: `git add <specific-file1> <specific-file2>`
+
+## Before Every Commit
+1. Run `git status` to see what's staged
+2. Check for unwanted files (gpucore*, *.log, __pycache__, etc.)
+3. Only then commit
+
+## Commit Frequency
+- Commit every ~50-100 lines changed
+- Use descriptive commit messages
+
+## Push Rules
+- Never push to upstream without permission
+- Work on YOUR fork: `git push fork branch-name`

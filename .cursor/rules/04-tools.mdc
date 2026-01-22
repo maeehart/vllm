@@ -1,0 +1,22 @@
+---
+description: Tool wrapper conventions - use *_markus.* wrappers when they exist
+globs: ["*_markus.*", "scripts/**/*", "tools/**/*"]
+alwaysApply: false
+---
+
+# 🔧 TOOL WRAPPERS (`_markus` suffix)
+
+## Rule: Check for wrapper first
+Before using any repo tool, check if a `*_markus.{sh|py}` wrapper exists.
+
+If wrapper exists → USE IT directly, don't read the original tool
+If no wrapper → Create one with documented interface
+
+## Naming Convention
+- `<descriptive_name>_markus.sh` for bash wrappers
+- `<descriptive_name>_markus.py` for Python wrappers
+
+## Why wrappers?
+- Consistent documentation format
+- Simplified interface with sensible defaults
+- Agent doesn't need to re-read complex original tools
