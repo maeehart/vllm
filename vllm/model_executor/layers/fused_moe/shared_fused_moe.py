@@ -1,26 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 import torch
 
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-
-_SHARED_DEBUG = os.environ.get("VLLM_SHARED_EXPERT_DEBUG", "0") == "1"
-_debug_logged = False
-
-
-def _log_shared_debug(msg: str):
-    """Log debug message once per rank."""
-    global _debug_logged
-    if _SHARED_DEBUG and not _debug_logged:
-        rank = get_tensor_model_parallel_rank()
-        print(f"[SharedFusedMoE DEBUG rank={rank}] {msg}", flush=True)
 
 
 # TODO(bnell): Add shared + fused combo function? e.g. +
@@ -74,10 +61,7 @@ class SharedFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        global _debug_logged
-        
         if not self.use_overlapped:
-            _log_shared_debug(f"use_overlapped=False branch")
             if self._shared_experts is not None:
                 shared_out = self._shared_experts(hidden_states)
 
@@ -93,13 +77,8 @@ class SharedFusedMoE(FusedMoE):
                     and self.moe_parallel_config.all2all_backend == "mori_ep"
                 )
                 should_reduce = must_reduce or uses_mori_ep
-                _log_shared_debug(f"tp_size={tp_size}, should_reduce={should_reduce}")
                 if tp_size > 1 and should_reduce:
-                    before_mean = shared_out.float().mean().item()
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
-                    after_mean = shared_out.float().mean().item()
-                    _log_shared_debug(f"REDUCED shared_out: before={before_mean:.6f}, after={after_mean:.6f}")
-                    _debug_logged = True
             else:
                 shared_out = None
 
@@ -108,9 +87,6 @@ class SharedFusedMoE(FusedMoE):
                 router_logits=router_logits,
             )
         else:
-            hs_mean = hidden_states.float().mean().item()
-            hs_std = hidden_states.float().std().item()
-            _log_shared_debug(f"use_overlapped=True | hidden_states: mean={hs_mean:.6f}, std={hs_std:.6f}")
             shared_out, fused_out = super().forward(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -133,30 +109,11 @@ class SharedFusedMoE(FusedMoE):
             )
             should_reduce = must_reduce or uses_mori_ep
             
-            _log_shared_debug(
-                f"tp_size={tp_size}, must_reduce={must_reduce}, uses_mori_ep={uses_mori_ep}, "
-                f"should_reduce={should_reduce}, shared_out is None: {shared_out is None}"
-            )
-            
             if (
                 shared_out is not None
                 and tp_size > 1
                 and should_reduce
             ):
-                before_mean = shared_out.float().mean().item()
-                before_std = shared_out.float().std().item()
                 shared_out = tensor_model_parallel_all_reduce(shared_out)
-                after_mean = shared_out.float().mean().item()
-                after_std = shared_out.float().std().item()
-                fused_mean = fused_out.float().mean().item()
-                fused_std = fused_out.float().std().item()
-                _log_shared_debug(
-                    f"REDUCED shared: before_mean={before_mean:.6f}, before_std={before_std:.6f}, "
-                    f"after_mean={after_mean:.6f}, after_std={after_std:.6f} | "
-                    f"fused_out: mean={fused_mean:.6f}, std={fused_std:.6f}"
-                )
-                _debug_logged = True
-            elif shared_out is None:
-                _log_shared_debug(f"WARNING: shared_out is None!")
-                _debug_logged = True
+
         return shared_out, fused_out

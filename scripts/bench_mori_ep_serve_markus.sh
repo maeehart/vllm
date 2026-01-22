@@ -157,38 +157,40 @@ start_server() {
     echo "Starting vLLM server with $BACKEND backend..."
     echo ""
     
-    # Build server command
-    SERVER_CMD="vllm serve $MODEL"
-    SERVER_CMD="$SERVER_CMD --host $HOST"
-    SERVER_CMD="$SERVER_CMD --port $PORT"
-    SERVER_CMD="$SERVER_CMD --tensor-parallel-size $TP_SIZE"
-    SERVER_CMD="$SERVER_CMD --max-model-len $MAX_MODEL_LEN"
-    SERVER_CMD="$SERVER_CMD --trust-remote-code"
+    # Build server command as array (handles quoting properly)
+    SERVER_ARGS=(
+        "vllm" "serve" "$MODEL"
+        "--host" "$HOST"
+        "--port" "$PORT"
+        "--tensor-parallel-size" "$TP_SIZE"
+        "--max-model-len" "$MAX_MODEL_LEN"
+        "--trust-remote-code"
+    )
     
     # Add expert parallel flags unless using basic TP
     if [[ "$BACKEND" != "none" && "$BACKEND" != "tp_only" ]]; then
-        SERVER_CMD="$SERVER_CMD --enable-expert-parallel"
-        SERVER_CMD="$SERVER_CMD --all2all-backend $BACKEND"
+        SERVER_ARGS+=("--enable-expert-parallel" "--all2all-backend" "$BACKEND")
         echo "Mode: Expert Parallel (EP) with $BACKEND"
         
-        # MORI-EP requires eager mode - CUDA graphs are incompatible with
-        # MORI's inter-GPU collective operations (dispatch/combine)
+        # MORI-EP: Disable CUDA graphs but keep torch.compile
+        # CUDA graphs are incompatible with MORI's inter-GPU collectives,
+        # but torch.compile can still optimize the compute graph
         if [[ "$BACKEND" == "mori_ep" ]]; then
-            SERVER_CMD="$SERVER_CMD --enforce-eager"
-            echo "Note: Using --enforce-eager (required for MORI-EP)"
+            SERVER_ARGS+=("--compilation-config" '{"cudagraph_mode": "NONE"}')
+            echo "Note: Using cudagraph_mode=NONE with torch.compile (required for MORI-EP)"
         fi
     else
         echo "Mode: Basic Tensor Parallel (TP$TP_SIZE, no EP)"
     fi
     
     # For DeepSeek R1, use FP8 KV cache for memory efficiency
-    SERVER_CMD="$SERVER_CMD --kv-cache-dtype fp8"
+    SERVER_ARGS+=("--kv-cache-dtype" "fp8")
     
-    echo "Command: $SERVER_CMD"
+    echo "Command: ${SERVER_ARGS[*]}"
     echo ""
     
     # Run server
-    exec $SERVER_CMD
+    exec "${SERVER_ARGS[@]}"
 }
 
 # Function to run benchmark
