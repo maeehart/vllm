@@ -325,12 +325,26 @@ class AiterExperts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        # TODO(rob): rocm_aiter_fused_experts uses self.quant_config's
-        # a_scales for static quantization. Update this to fit better
-        # with the interface once all quant integrations are complete.
-        assert a1q_scale is None
-        assert a2_scale == self.quant_config.a2_scale
+        # For dynamic quantization (e.g., MORI-EP with FP8), use the passed
+        # a1q_scale instead of the static quant_config.a1_scale.
+        # This fixes garbage output when activation scales are computed
+        # dynamically during MORI dispatch.
         assert expert_tokens_meta is None
+
+        # Create a copy of quant_config with dynamic a1_scale if provided
+        quant_config = self.quant_config
+        if a1q_scale is not None:
+            # Override static scale with dynamic scale from MORI
+            quant_config = FusedMoEQuantConfig.make(
+                quant_dtype=self.quant_config.quant_dtype,
+                per_act_token_quant=self.quant_config.per_act_token_quant,
+                per_out_ch_quant=self.quant_config.per_out_ch_quant,
+                block_shape=self.quant_config.block_shape,
+                w1_scale=self.quant_config.w1_scale,
+                w2_scale=self.quant_config.w2_scale,
+                a1_scale=a1q_scale,  # Use dynamic scale!
+                a2_scale=a2_scale if a2_scale is not None else self.quant_config.a2_scale,
+            )
 
         result = rocm_aiter_fused_experts(
             hidden_states=hidden_states,
@@ -341,7 +355,7 @@ class AiterExperts(mk.FusedMoEPermuteExpertsUnpermute):
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_map=expert_map,
-            quant_config=self.quant_config,
+            quant_config=quant_config,
         )
         assert result.shape == output.shape
         output.copy_(result)

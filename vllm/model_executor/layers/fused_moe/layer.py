@@ -1532,8 +1532,17 @@ class FusedMoE(CustomOp):
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """
         Some combine kernels reduce across GPU ranks by default.
+        When using MORI-EP or other backends that reduce output internally,
+        we should skip the additional all-reduce here.
         """
-        if self.must_reduce_shared_expert_outputs():
+        # Check if output is already reduced:
+        # 1. Standard check via must_reduce_shared_expert_outputs()
+        # 2. OR if MORI-EP is used (which reduces routed output internally)
+        uses_mori_ep = (
+            self.moe_parallel_config is not None
+            and self.moe_parallel_config.all2all_backend == "mori_ep"
+        )
+        if self.must_reduce_shared_expert_outputs() or uses_mori_ep:
             return final_hidden_states
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
