@@ -1593,9 +1593,20 @@ class FusedMoE(CustomOp):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
-        return (
-            self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
-        )
+        # Returns expert_map for EP mode filtering/remapping.
+        #
+        # _expert_map[global_id] = local_id (0 to num_local_experts-1)
+        #                       or -1 if expert not on this rank
+        #
+        # For AITER with MORI EP: Return None because MORI handles the
+        # global→local conversion and weight zeroing internally.
+        # AITER can't handle -1 values in expert_map.
+        #
+        # For Triton/other backends: Return _expert_map for filtering/remapping.
+        if self.rocm_aiter_fmoe_enabled:
+            # MORI converts IDs to local and zeros non-local weights
+            return None
+        return self._expert_map
 
     def forward_cuda(
         self,

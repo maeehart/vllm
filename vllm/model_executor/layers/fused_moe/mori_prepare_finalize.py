@@ -228,8 +228,27 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # dispatch(input, weights, scales, indices)
         # Returns: (recv_x, recv_weights, recv_scale, recv_topk_ids, recv_src_pos)
         import os
+        ep_rank = self.rank_expert_offset // self.num_local_experts
+        
+        # TRACE mode: detailed value dump for single-layer debugging
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n{'='*80}")
+            print(f"[TRACE STEP 1: DISPATCH INPUT] ep_rank={ep_rank}")
+            print(f"  tokens shape={tokens.shape}, dtype={tokens.dtype}")
+            if tokens.numel() > 0:
+                print(f"  tokens[0,:5]={tokens[0,:5].float().tolist()}")
+                print(f"  tokens mean={tokens.float().mean().item():.6f}, std={tokens.float().std().item():.6f}")
+            else:
+                print(f"  tokens is EMPTY!")
+            print(f"  topk_ids shape={topk_ids.shape}")
+            if topk_ids.numel() > 0:
+                print(f"  topk_ids[0]={topk_ids[0].tolist()}")
+            print(f"  topk_weights shape={topk_weights.shape}")
+            if topk_weights.numel() > 0:
+                print(f"  topk_weights[0]={topk_weights[0].tolist()}")
+                print(f"  topk_weights[0].sum()={topk_weights[0].sum().item():.6f}")
+        
         if os.environ.get("VLLM_MORI_DEBUG"):
-            ep_rank = self.rank_expert_offset // self.num_local_experts
             print(f"[MORI DISPATCH DEBUG] ep_rank={ep_rank}, "
                   f"tokens shape={tokens.shape}, topk_ids shape={topk_ids.shape}, "
                   f"tokens mean={tokens.float().mean().item():.4f}")
@@ -312,6 +331,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         #
         # NOTE: This uses .item() which breaks CUDA graph capture.
         # For CUDA graph support, we'll need a different approach.
+        import os
+        ep_rank = self.rank_expert_offset // self.num_local_experts
+        
         num_valid = None
         if total_recv_tokens is not None:
             num_valid = int(total_recv_tokens.item())
@@ -324,18 +346,44 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 if recv_topk_ids is not None:
                     recv_topk_ids = recv_topk_ids[:num_valid]
         
-        # CRITICAL FIX: Deduplicate received entries by source token!
+        # TRACE mode: values after receive
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n[TRACE STEP 2: AFTER RECEIVE] ep_rank={ep_rank}")
+            print(f"  num_valid={num_valid}")
+            print(f"  expert_x shape={expert_x.shape}")
+            if expert_x.numel() > 0:
+                print(f"  expert_x[0,:5]={expert_x[0,:5].float().tolist()}")
+                print(f"  expert_x mean={expert_x.float().mean().item():.6f}, std={expert_x.float().std().item():.6f}")
+            else:
+                print(f"  expert_x is EMPTY!")
+            if recv_topk_ids is not None and recv_topk_ids.numel() > 0:
+                print(f"  recv_topk_ids[0]={recv_topk_ids[0].tolist()}")
+            if recv_weights is not None and recv_weights.numel() > 0:
+                print(f"  recv_weights[0]={recv_weights[0].tolist()}")
+                print(f"  recv_weights[0].sum()={recv_weights[0].sum().item():.6f}")
+        
+        # CRITICAL FIX: Deduplicate by LOCAL TOKEN INDEX to handle TP duplication!
         #
-        # With TP=8, all 8 ranks process the SAME token with identical routing.
-        # Each rank dispatches to expert owners, so rank R receives the same
-        # token 8 times from 8 different source ranks!
+        # 🔴 THE PROBLEM:
+        # MORI dispatches at (token, expert) granularity. When a token has N local
+        # experts on this rank, we receive N entries for the same token.
+        # 
+        # With TP=8 + EP: all 8 source ranks have IDENTICAL tokens (TP replication).
+        # Each dispatches to same experts → we receive 8 × N entries per logical token!
         #
-        # MORI's src_token_pos is a BUFFER OFFSET (rank × 8192), NOT token ID.
-        # So we deduplicate by topk_ids pattern instead - identical topk_ids 
-        # means identical source token.
+        # Current buggy flow for token T with 2 local experts [E1, E2]:
+        #   - Receive Entry A (for E1): AITER computes E1(T)*w1 + E2(T)*w2
+        #   - Receive Entry B (for E2): AITER computes E1(T)*w1 + E2(T)*w2 (SAME!)
+        #   - Combine sums: 2 × (E1(T)*w1 + E2(T)*w2) = 2× correct value!
         #
-        # Solution: Keep only unique topk_id patterns, process once with AITER,
-        # then replicate results for combine.
+        # 🔴 THE FIX:
+        # Dedup by LOCAL_TOKEN_IDX = src_token_pos % max_tokens_per_rank
+        # - In TP mode: 8 entries from 8 source ranks with same local_idx → merge to 1
+        # - Process ONCE with AITER → correct weighted sum
+        # - Expand back for combine (which routes to correct sources)
+        #
+        # Formula: src_token_pos = src_rank × max_tokens + local_token_idx
+        # Same local_token_idx across ranks = same logical token in TP mode
         import os
         
         src_token_pos = self.ep_op.get_dispatch_src_token_pos()
@@ -349,49 +397,118 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             if src_token_pos.numel() > 0:
                 print(f"[MORI SRC_POS DEBUG] min={src_token_pos.min().item()}, max={src_token_pos.max().item()}")
         
-        # Deduplicate by topk_ids pattern (not src_token_pos which is buffer offset)
-        if recv_topk_ids is not None and recv_topk_ids.numel() > 0 and recv_topk_ids.shape[0] > 1:
-            # Find unique topk_id patterns
-            unique_patterns, inverse_indices = torch.unique(
-                recv_topk_ids, dim=0, return_inverse=True
+        # Deduplicate by LOCAL TOKEN INDEX to handle TP + EP correctly
+        # src_token_pos = src_rank × max_tokens + local_idx
+        # We dedup by local_idx (same logical token position across TP ranks)
+        if (src_token_pos is not None and 
+            src_token_pos.numel() > 0 and 
+            num_valid is not None and num_valid > 1):
+            # Slice src_token_pos to match the valid token count
+            src_token_pos_valid = src_token_pos[:num_valid]
+            
+            # Compute local_token_idx = src_token_pos % max_tokens_per_rank
+            # We need max_tokens_per_rank - infer from the spacing of positions
+            # In TP mode, consecutive source ranks have positions differing by max_tokens
+            # Alternatively, use the GCD of differences or a known constant
+            #
+            # For safety, we use the value from recv_x shape (max expected tokens)
+            # This works because MORI registers buffers with this size
+            max_tokens_per_rank = expert_x.shape[0]  # Use buffer size as upper bound
+            
+            # But the actual max is configured - let's compute from position spacing
+            # Sort positions and check minimum non-zero difference
+            if src_token_pos_valid.numel() >= 2:
+                sorted_pos, _ = src_token_pos_valid.sort()
+                diffs = sorted_pos[1:] - sorted_pos[:-1]
+                nonzero_diffs = diffs[diffs > 0]
+                if nonzero_diffs.numel() > 0:
+                    # The spacing between consecutive entries from same rank is typically 1
+                    # The spacing between entries from different ranks is max_tokens
+                    # So max_tokens = max(diffs) or a large common factor
+                    # For TP, we just need local_idx consistency
+                    max_diff = diffs.max().item()
+                    if max_diff > 1000:  # Looks like inter-rank spacing
+                        max_tokens_per_rank = max_diff
+                    else:
+                        # Fall back to a reasonable default (8192 is common)
+                        max_tokens_per_rank = 8192
+                else:
+                    max_tokens_per_rank = 8192  # Default
+            else:
+                max_tokens_per_rank = 8192  # Default
+            
+            # Compute local token index for dedup
+            local_token_idx = src_token_pos_valid % max_tokens_per_rank
+            
+            # Find unique local token indices (same local_idx = same logical token)
+            unique_local_idx, inverse_indices = torch.unique(
+                local_token_idx, return_inverse=True
             )
-            num_unique = unique_patterns.shape[0]
+            num_unique = unique_local_idx.shape[0]
             
             if os.environ.get("VLLM_MORI_DEBUG"):
                 ep_rank = self.rank_expert_offset // self.num_local_experts
-                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, unique_patterns={num_unique}")
+                print(f"[MORI DEDUP] ep_rank={ep_rank}, total_recv={num_valid}, "
+                      f"unique_local_tokens={num_unique}, max_tokens_per_rank={max_tokens_per_rank}")
+                if num_valid <= 16:
+                    print(f"[MORI DEDUP] local_token_idx={local_token_idx.tolist()}")
             
-            if num_unique < recv_topk_ids.shape[0]:
-                # Get indices of first occurrence of each unique pattern
-                first_indices = torch.empty(num_unique, dtype=torch.long, device=recv_topk_ids.device)
-                first_indices.fill_(recv_topk_ids.shape[0])  # Initialize with max
-                arange = torch.arange(recv_topk_ids.shape[0], device=recv_topk_ids.device)
+            if num_unique < num_valid:
+                # Get indices of first occurrence of each unique local token
+                first_indices = torch.empty(num_unique, dtype=torch.long, device=src_token_pos.device)
+                first_indices.fill_(num_valid)  # Initialize with max
+                arange = torch.arange(num_valid, device=src_token_pos.device)
                 first_indices.scatter_reduce_(0, inverse_indices, arange, reduce='amin')
                 
                 if os.environ.get("VLLM_MORI_DEBUG"):
-                    print(f"[MORI DEDUP] Reducing {recv_topk_ids.shape[0]} entries to {num_unique} unique")
-                    print(f"[MORI DEDUP] first_indices={first_indices.tolist()}")
+                    print(f"[MORI DEDUP] Reducing {num_valid} entries to {num_unique} unique local tokens")
+                    if num_unique <= 16:
+                        print(f"[MORI DEDUP] first_indices={first_indices.tolist()}")
                 
-                # Keep only first occurrence of each unique pattern
+                # Keep only first occurrence of each unique local token
                 expert_x = expert_x[first_indices]
                 if expert_x_scale is not None:
                     expert_x_scale = expert_x_scale[first_indices]
                 if recv_weights is not None:
                     recv_weights = recv_weights[first_indices]
-                recv_topk_ids = unique_patterns  # Use the unique patterns directly
+                if recv_topk_ids is not None:
+                    recv_topk_ids = recv_topk_ids[first_indices]
                 
                 # Store info needed to expand results back for combine
                 self._dedup_inverse_indices = inverse_indices
                 self._dedup_num_unique = num_unique
                 self._dedup_original_count = num_valid
             else:
+                # All local tokens are unique - no dedup needed
                 self._dedup_inverse_indices = None
                 self._dedup_num_unique = None
                 self._dedup_original_count = None
         else:
+            # No src_token_pos available or only 1 entry - no dedup
             self._dedup_inverse_indices = None
             self._dedup_num_unique = None
             self._dedup_original_count = None
+
+        # TRACE mode: values after dedup
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n[TRACE STEP 3: AFTER DEDUP] ep_rank={ep_rank}")
+            print(f"  dedup_inverse_indices={self._dedup_inverse_indices is not None}")
+            if self._dedup_inverse_indices is not None:
+                print(f"  original_count={self._dedup_original_count}, num_unique={self._dedup_num_unique}")
+                if self._dedup_inverse_indices.numel() <= 16:
+                    print(f"  inverse_indices={self._dedup_inverse_indices.tolist()}")
+            print(f"  expert_x shape={expert_x.shape}")
+            if expert_x.numel() > 0:
+                print(f"  expert_x[0,:5]={expert_x[0,:5].float().tolist()}")
+                print(f"  expert_x mean={expert_x.float().mean().item():.6f}, std={expert_x.float().std().item():.6f}")
+            else:
+                print(f"  expert_x is EMPTY!")
+            if recv_topk_ids is not None and recv_topk_ids.numel() > 0:
+                print(f"  recv_topk_ids shape={recv_topk_ids.shape}")
+                print(f"  recv_topk_ids[0]={recv_topk_ids[0].tolist()}")
+            if recv_weights is not None and recv_weights.numel() > 0:
+                print(f"  recv_weights shape={recv_weights.shape}")
+                print(f"  recv_weights[0]={recv_weights[0].tolist()}")
 
         # Expert ID handling: Convert GLOBAL IDs to LOCAL IDs
         #
@@ -423,11 +540,33 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 print(f"[MORI DEBUG] num_valid={num_valid if 'num_valid' in dir() else 'N/A'}")
                 print(f"[MORI DEBUG] rank_expert_offset={self.rank_expert_offset}, num_local_experts={self.num_local_experts}")
             
-            # Keep GLOBAL IDs - let expert_map handle the conversion
-            # MORI copies full topk_ids (all 8 experts) for each received token.
-            # expert_map[global_id] = local_id (or -1 if not on this rank)
-            # AITER will filter out experts where expert_map gives -1
-            expert_topk_ids = recv_topk_ids.to(torch.int64)
+            # Convert GLOBAL IDs to LOCAL IDs and zero-out non-local expert weights
+            #
+            # MORI copies full topk_ids (all 8 global expert IDs) for each token.
+            # For AITER EP, we need to:
+            #   1. Convert global → local IDs
+            #   2. Zero weights for non-local experts (so they don't contribute)
+            #   3. Clamp local IDs to valid range (for non-local, use 0 as placeholder)
+            #
+            # Example for rank 0 (experts 0-31):
+            #   global_id=3 → local_id=3, weight unchanged
+            #   global_id=79 → local_id=47 (out of range), weight→0, clamp to 0
+            #
+            # This approach avoids passing expert_map to AITER (which can't handle -1).
+            global_topk_ids = recv_topk_ids.to(torch.int64)
+            
+            # Convert to local IDs
+            local_topk_ids = global_topk_ids - self.rank_expert_offset
+            
+            # Create mask for local experts
+            is_local_expert = (local_topk_ids >= 0) & (local_topk_ids < self.num_local_experts)
+            
+            # Zero out weights for non-local experts
+            if recv_weights is not None:
+                recv_weights = recv_weights * is_local_expert.float()
+            
+            # Clamp local IDs to valid range (non-local will have 0 weight anyway)
+            expert_topk_ids = local_topk_ids.clamp(min=0, max=self.num_local_experts - 1)
             
             # Debug: Show expert_x shape to understand received data
             if os.environ.get("VLLM_MORI_DEBUG"):
@@ -487,6 +626,28 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                       f"sum={recv_weights.sum().item():.4f}")
             else:
                 print(f"[MORI RECEIVER DEBUG] recv_weights is None!")
+
+        # TRACE mode: output to AITER
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n[TRACE STEP 4: OUTPUT TO AITER] ep_rank={ep_rank}")
+            print(f"  expert_x shape={expert_x.shape}")
+            if expert_x.numel() > 0:
+                print(f"  expert_x[0,:5]={expert_x[0,:5].float().tolist()}")
+                print(f"  expert_x mean={expert_x.float().mean().item():.6f}, std={expert_x.float().std().item():.6f}")
+            else:
+                print(f"  expert_x is EMPTY!")
+            if expert_topk_ids is not None and expert_topk_ids.numel() > 0:
+                print(f"  expert_topk_ids shape={expert_topk_ids.shape}")
+                print(f"  expert_topk_ids[0]={expert_topk_ids[0].tolist()}")
+                # Show which experts are LOCAL
+                sample_ids = expert_topk_ids[0].tolist()
+                local_experts = [eid for eid in sample_ids 
+                                 if self.rank_expert_offset <= eid < self.rank_expert_offset + self.num_local_experts]
+                print(f"  LOCAL experts in topk (rank_offset={self.rank_expert_offset}): {local_experts}")
+            if recv_weights is not None and recv_weights.numel() > 0:
+                print(f"  recv_weights shape={recv_weights.shape}")
+                print(f"  recv_weights[0]={recv_weights[0].tolist()}")
+            print(f"{'='*80}\n")
 
         return (
             expert_x,
@@ -643,6 +804,25 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                       f"nan_count={torch.isnan(fused_expert_output).sum().item()}, "
                       f"zero_rows={(fused_expert_output.abs().sum(dim=1) == 0).sum().item()}")
 
+        ep_rank = self.rank_expert_offset // self.num_local_experts
+        
+        # TRACE mode: AITER output (before weight_and_reduce)
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n{'='*80}")
+            print(f"[TRACE STEP 5: AITER OUTPUT (raw)] ep_rank={ep_rank}")
+            print(f"  fused_expert_output shape={fused_expert_output.shape}")
+            if fused_expert_output.numel() > 0:
+                print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
+                print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
+            else:
+                print(f"  fused_expert_output is EMPTY!")
+            print(f"  topk_weights shape={topk_weights.shape}")
+            if topk_weights.numel() > 0:
+                print(f"  topk_weights[0]={topk_weights[0].tolist()}")
+            print(f"  topk_ids shape={topk_ids.shape}")
+            if topk_ids.numel() > 0:
+                print(f"  topk_ids[0]={topk_ids[0].tolist()}")
+
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
         if fused_expert_output.numel() != 0:
@@ -662,15 +842,43 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
             
-            # CRITICAL: Expand deduplicated results back to full size for combine
-            # We processed unique tokens only, but combine expects one result per
-            # dispatched entry (including duplicates).
+            # TRACE mode: after weight_and_reduce
+            if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+                print(f"\n[TRACE STEP 6: AFTER WEIGHT_AND_REDUCE] ep_rank={ep_rank}")
+                print(f"  fused_expert_output shape={fused_expert_output.shape}")
+                if fused_expert_output.numel() > 0:
+                    print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
+                    print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
+            
+            # MORI combine expects input shape to match RECEIVED count from dispatch,
+            # NOT the original token count. Expand deduplicated results back to 
+            # the received count so MORI can route each result correctly.
+            #
+            # Example: TP=8 decode, we receive 8 entries (from 8 TP ranks), dedup to 1,
+            # compute once, then expand back to 8 for combine.
             if self._dedup_inverse_indices is not None:
-                import os
                 if os.environ.get("VLLM_MORI_DEBUG"):
                     print(f"[MORI EXPAND] Expanding {fused_expert_output.shape[0]} -> {self._dedup_inverse_indices.numel()}")
                     print(f"[MORI EXPAND] inverse_indices={self._dedup_inverse_indices.tolist()}")
+                
+                # TRACE mode: before expand
+                if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+                    print(f"\n[TRACE STEP 7: BEFORE EXPAND] ep_rank={ep_rank}")
+                    print(f"  fused_expert_output shape={fused_expert_output.shape}")
+                    print(f"  inverse_indices shape={self._dedup_inverse_indices.shape}")
+                    if self._dedup_inverse_indices.numel() <= 16:
+                        print(f"  inverse_indices={self._dedup_inverse_indices.tolist()}")
+                
                 fused_expert_output = fused_expert_output[self._dedup_inverse_indices]
+                
+                # TRACE mode: after expand
+                if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+                    print(f"\n[TRACE STEP 8: AFTER EXPAND] ep_rank={ep_rank}")
+                    print(f"  fused_expert_output shape={fused_expert_output.shape}")
+                    if fused_expert_output.numel() > 0:
+                        print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
+                        print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
+                
                 if os.environ.get("VLLM_MORI_DEBUG"):
                     print(f"[MORI EXPAND] AFTER expand: fused_expert_output shape={fused_expert_output.shape}")
 
@@ -712,6 +920,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             if fused_expert_output.numel() > 0:
                 print(f"[MORI COMBINE INPUT] fused_expert_output[0] mean={fused_expert_output[0].float().mean().item():.4f}")
         
+        # TRACE mode: before combine
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n[TRACE STEP 9: BEFORE COMBINE] ep_rank={ep_rank}")
+            print(f"  fused_expert_output shape={fused_expert_output.shape}")
+            if fused_expert_output.numel() > 0:
+                print(f"  fused_expert_output[0,:5]={fused_expert_output[0,:5].float().tolist()}")
+                print(f"  fused_expert_output mean={fused_expert_output.float().mean().item():.6f}, std={fused_expert_output.float().std().item():.6f}")
+            else:
+                print(f"  fused_expert_output is EMPTY!")
+            print(f"  original_topk_ids shape={original_topk_ids.shape}")
+            if original_topk_ids.numel() > 0:
+                print(f"  original_topk_ids[0]={original_topk_ids[0].tolist()}")
+        
         combine_result = self.ep_op.combine(
             input=fused_expert_output,
             weights=None,  # AITER already applied weights
@@ -720,6 +941,27 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         combined_x = combine_result[0]
+
+        # TRACE mode: after combine
+        if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+            print(f"\n[TRACE STEP 10: AFTER COMBINE] ep_rank={ep_rank}")
+            print(f"  combined_x shape={combined_x.shape}")
+            if combined_x.numel() > 0:
+                # Only show stats for VALID output (first num_tokens rows)
+                num_tokens = output.shape[0]
+                valid_output = combined_x[:num_tokens]
+                print(f"  valid_output[0,:5]={valid_output[0,:5].float().tolist()}")
+                print(f"  valid_output mean={valid_output.float().mean().item():.6f}, std={valid_output.float().std().item():.6f}")
+                # Sanity check: is the output reasonable?
+                out_std = valid_output.float().std().item()
+                if out_std > 10:
+                    print(f"  ⚠️ WARNING: Output std={out_std:.2f} is suspiciously large!")
+                elif out_std < 0.001:
+                    print(f"  ⚠️ WARNING: Output std={out_std:.6f} is suspiciously small!")
+                else:
+                    print(f"  ✅ Output std looks reasonable")
+            print(f"  output shape={output.shape}")
+            print(f"{'='*80}\n")
 
         # Debug: check combine output values
         if os.environ.get("VLLM_MORI_DEBUG"):
@@ -750,14 +992,64 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             print(f"[MORI FINAL DEBUG] After sync, combined_x[:1] mean={combined_x[:1].float().mean().item():.4f}")
 
         if do_async:
+            # Capture variables for the closure
+            _ep_rank = ep_rank
+            _combined_x = combined_x
+            _output = output
+            
             def _receiver():
                 # Respect inplace outputs
-                output.copy_(combined_x, non_blocking=True)
+                _output.copy_(_combined_x, non_blocking=True)
+                
+                # TRACE mode: final output check (async path)
+                import os as _os
+                if _os.environ.get("VLLM_MORI_TRACE") and _ep_rank == 0:
+                    torch.cuda.synchronize()
+                    print(f"\n[TRACE STEP 11: FINAL OUTPUT (async)] ep_rank={_ep_rank}")
+                    print(f"  output shape={_output.shape}")
+                    if _output.numel() > 0:
+                        print(f"  output[0,:5]={_output[0,:5].float().tolist()}")
+                        print(f"  output mean={_output.float().mean().item():.6f}, std={_output.float().std().item():.6f}")
+                        # Comprehensive sanity checks
+                        nan_count = torch.isnan(_output).sum().item()
+                        inf_count = torch.isinf(_output).sum().item()
+                        zero_count = (_output.abs() < 1e-10).sum().item()
+                        outlier_count = (_output.abs() > 100).sum().item()
+                        print(f"  NaN={nan_count}, Inf={inf_count}, ~Zero={zero_count}, Outliers(>100)={outlier_count}")
+                        if nan_count > 0 or inf_count > 0:
+                            print(f"  ⚠️ CRITICAL: NaN or Inf detected in output!")
+                        if outlier_count > 100:
+                            print(f"  ⚠️ WARNING: Many outlier values detected!")
+                    print(f"{'='*80}\n")
 
             return _receiver
         else:
             # Synchronous: copy immediately  
             output.copy_(combined_x, non_blocking=True)
+            
+            # TRACE mode: final output check
+            if os.environ.get("VLLM_MORI_TRACE") and ep_rank == 0:
+                torch.cuda.synchronize()
+                print(f"\n[TRACE STEP 11: FINAL OUTPUT] ep_rank={ep_rank}")
+                print(f"  output shape={output.shape}")
+                if output.numel() > 0:
+                    print(f"  output[0,:5]={output[0,:5].float().tolist()}")
+                    print(f"  output mean={output.float().mean().item():.6f}, std={output.float().std().item():.6f}")
+                    # Comprehensive sanity checks
+                    nan_count = torch.isnan(output).sum().item()
+                    inf_count = torch.isinf(output).sum().item()
+                    zero_count = (output.abs() < 1e-10).sum().item()
+                    outlier_count = (output.abs() > 100).sum().item()
+                    print(f"  NaN={nan_count}, Inf={inf_count}, ~Zero={zero_count}, Outliers(>100)={outlier_count}")
+                    # Check if output matches combined_x slice
+                    if combined_x.numel() > 0:
+                        diff = (output - combined_x).abs().max().item()
+                        print(f"  output vs combined_x max_diff={diff}")
+                    if nan_count > 0 or inf_count > 0:
+                        print(f"  ⚠️ CRITICAL: NaN or Inf detected in output!")
+                    if outlier_count > 100:
+                        print(f"  ⚠️ WARNING: Many outlier values detected!")
+                print(f"{'='*80}\n")
             
             # DEBUG: Check output after copy
             if os.environ.get("VLLM_MORI_DEBUG"):
