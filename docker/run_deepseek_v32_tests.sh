@@ -8,6 +8,9 @@
 #
 # Multi-GPU (e.g. 8x MI355X): use HIP_VISIBLE_DEVICES to pick GPU(s) for tests.
 #   HIP_VISIBLE_DEVICES=0 ./docker/run_deepseek_v32_tests.sh IMAGE ...
+#
+# VLLM_TARGET_DEVICE defaults to rocm so editable installs do not hit setup.py's
+# CUDA/NVCC path (PyTorch ROCm may still report torch.version.cuda).
 #   HIP_VISIBLE_DEVICES=0,1 ./docker/run_deepseek_v32_tests.sh IMAGE ...
 #
 # Optional: VLLM_DOCKER_ROCM_IPC=1 adds --ipc=host (sometimes helps ROCm in containers).
@@ -61,6 +64,7 @@ docker run --rm -i \
   "${EXTRA_DEVICES[@]}" \
   "${GROUP_ADD[@]}" \
   -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+  -e VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE:-rocm}" \
   -e HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-}" \
   -v "$REPO_ROOT:/src/vllm" \
   -w /src/vllm \
