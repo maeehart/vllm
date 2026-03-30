@@ -72,6 +72,7 @@ docker run --rm -i \
   bash -c 'set -euo pipefail
     export AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1
     export VLLM_ROCM_USE_AITER=1
-    python3 -m pip install -q -e .
+    # Use image ROCm PyTorch (HIP); isolated build env has CPU torch → unknown device in setup.py.
+    python3 -m pip install -q -e . --no-build-isolation
     exec python3 -m pytest "$@"
   ' bash "$@"
