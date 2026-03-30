@@ -21,6 +21,12 @@
 # Example:
 #   ./docker/run_deepseek_v32_tests.sh vllm-dsv32:rocm60326_full_fix \
 #     tests/kernels/attention/test_deepgemm_attention.py -v --tb=short
+#
+# Note: tests/kernels/attention/test_deepgemm_attention.py is CUDA-only (skip on ROCm).
+# For a full editable rebuild from the mounted tree: VLLM_DOCKER_TEST_EDITABLE=1
+#
+# Optional env:
+#   VLLM_DOCKER_TEST_EDITABLE=1  — pip install -e . --no-build-isolation (slow; needs disk)
 
 set -euo pipefail
 
@@ -65,14 +71,9 @@ docker run --rm -i \
   "${GROUP_ADD[@]}" \
   -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
   -e VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE:-rocm}" \
+  -e VLLM_DOCKER_TEST_EDITABLE="${VLLM_DOCKER_TEST_EDITABLE:-0}" \
   -e HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-}" \
   -v "$REPO_ROOT:/src/vllm" \
   -w /src/vllm \
   "$IMAGE" \
-  bash -c 'set -euo pipefail
-    export AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1
-    export VLLM_ROCM_USE_AITER=1
-    # Use image ROCm PyTorch (HIP); isolated build env has CPU torch → unknown device in setup.py.
-    python3 -m pip install -q -e . --no-build-isolation
-    exec python3 -m pytest "$@"
-  ' bash "$@"
+  bash /src/vllm/docker/docker_test_inner.sh "$@"
