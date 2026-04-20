@@ -49,13 +49,16 @@ class QuickAllReduce:
     # The following data is based on kernel tests.
     # In this order [FP, INT8, INT6, INT4].
     _QR_MIN_SIZE = {
-        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
-        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
-        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB],
-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
-        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
+        (torch.float16, 2): [0, 2 * MB, 2 * MB, 1 * MB],
+        (torch.float16, 4): [0, 16 * MB, 4 * MB, 2 * MB],
+        (torch.float16, 8): [0, 4 * MB, 4 * MB, 2 * MB],
+        (torch.bfloat16, 2): [0, 8 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 4): [0, 64 * MB, 64 * MB, 16 * MB],
+        (torch.bfloat16, 8): [0, 2048 * MB, 2048 * MB, 2048 * MB],
     }
+    # Threshold for using FP16 (unquantized) instead of configured quantization
+    # Based on performance benchmarks, FP16 is faster for small sizes.
+    _QR_FP16_THRESHOLD = 2 * MB
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
         """
@@ -262,10 +265,17 @@ class QuickAllReduce:
         dtype = inp.dtype
         if self.use_fp16_kernels:
             dtype = torch.float16
+
+        # Determine which quantization level we would use
+        if inp_size < self._QR_FP16_THRESHOLD:
+            target_quant_level = QuickReduceRegime.FP.value
+        else:
+            target_quant_level = self.qr_quant_level.value
+
         return (
             inp_size <= self.qr_max_size
             and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
+            >= self._QR_MIN_SIZE[(dtype, self.world_size)][target_quant_level]
         )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
@@ -274,8 +284,15 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size < self._QR_FP16_THRESHOLD:
+            quant_level = QuickReduceRegime.FP.value
+        else:
+            quant_level = self.qr_quant_level.value
+
         ops.qr_all_reduce(
-            self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
+            self._ptr, inp, out, quant_level, self.use_fp16_kernels
         )
         return out
 
