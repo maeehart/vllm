@@ -334,7 +334,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # same transform the parent build applies on device tensors.
         num_decodes = metadata.num_decodes
         qsl_cpu = common_attn_metadata.query_start_loc_cpu
-        qo_indptr_cpu = (qsl_cpu[num_decodes:] - qsl_cpu[num_decodes]).to(torch.int32)
+        qo_indptr_cpu = (qsl_cpu[num_decodes:] - qsl_cpu[num_decodes]).to(
+            torch.int32
+        )
         kv_indptr_cpu = qo_indptr_cpu.clone()
         seq_lens_cpu = (qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).to(torch.int32)
 
@@ -797,7 +799,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         MLA prefill is disabled, PS metadata is missing, or chunked
         context requires two-pass merge.
         """
-        if not self._fp8_prefill_enabled or not hasattr(
+        import os
+        _force_varlen = os.environ.get("VLLM_ROCM_FP8_MLA_DISABLE", "0") == "1"
+        if _force_varlen:
+            logger.warning_once(
+                "VLLM_ROCM_FP8_MLA_DISABLE=1 set: forwarding prefill via "
+                "flash_attn_varlen_func (parent forward_mha fallback)."
+            )
+        if _force_varlen or not self._fp8_prefill_enabled or not hasattr(
             attn_metadata, "fp8_prefill_qo_indptr"
         ):
             return super().forward_mha(
