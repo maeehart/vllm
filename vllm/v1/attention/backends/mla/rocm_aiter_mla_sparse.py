@@ -7,28 +7,28 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
-from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
+    QueryLenSupport,
     get_mla_dims,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
-    AttentionBackend,
     AttentionCGSupport,
     AttentionLayer,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
     MultipleOf,
-    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
+    AiterMLABackend,
+    AiterMLADecodeMetadata,
     AiterMLAHelper,
+    AiterMLAImpl,
+    AiterMLAMetadata,
+    AiterMLAMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -163,63 +163,6 @@ def triton_convert_req_index_to_global_index(
 
 
 @triton.jit
-def generate_sparse_seqlen_kernel(
-    seq_len_ptr,  # [num_seq]
-    cu_query_lens_ptr,  # [num_seq]
-    out_ptr,  # [num_query_tokens]
-    topk_token: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    seq_id = tl.program_id(0)
-    query_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    query_start = tl.load(cu_query_lens_ptr + seq_id)
-    query_end = tl.load(cu_query_lens_ptr + seq_id + 1)
-    if query_start + tl.program_id(1) * BLOCK_SIZE > query_end:
-        return
-    query_len = query_end - query_start
-    query_mask = query_offset + query_start < query_end
-    seq_len = tl.load(seq_len_ptr + seq_id)
-    # Just return since the out_ptr is zero initialized.
-    if seq_len == 0:
-        return
-    context_start_point = seq_len - query_len
-    sparse_seqlen = context_start_point + query_offset
-    sparse_seqlen_masked = tl.where(
-        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
-    )
-    tl.store(
-        out_ptr + query_start + query_offset, sparse_seqlen_masked, mask=query_mask
-    )
-
-
-def generate_sparse_seqlen_triton(
-    query_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    cu_query_lens: torch.Tensor,
-    topk_token: int,
-    num_tokens: int,
-    max_query_len: int,
-):
-    num_seqs = query_lens.size(0)
-    # zero initialize the tensor to make sure invalid positions will be zero
-    out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
-    block_size = 64
-    num_block_per_row = triton.cdiv(max_query_len, block_size)
-    grid = (
-        num_seqs,
-        num_block_per_row,
-    )
-    generate_sparse_seqlen_kernel[grid](
-        seq_lens,
-        cu_query_lens,
-        out,
-        topk_token,
-        block_size,
-    )
-    return out
-
-
-@triton.jit
 def fetch_id_to_ragged_kernel(
     in_tensor_ptr,  # [num_seq, topk]
     cumsum_ptr,  # [num_seq + 1]
@@ -261,8 +204,74 @@ def fetch_id_to_ragged_triton(
     )
 
 
-class ROCMAiterMLASparseBackend(AttentionBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+@triton.jit
+def generate_sparse_seqlen_kernel(
+    seq_len_ptr,
+    cu_query_lens_ptr,
+    out_ptr,
+    topk_token: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    seq_id = tl.program_id(0)
+    query_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    query_start = tl.load(cu_query_lens_ptr + seq_id)
+    query_end = tl.load(cu_query_lens_ptr + seq_id + 1)
+    if query_start + tl.program_id(1) * BLOCK_SIZE > query_end:
+        return
+    query_len = query_end - query_start
+    query_mask = query_offset + query_start < query_end
+    seq_len = tl.load(seq_len_ptr + seq_id)
+    if seq_len == 0:
+        return
+    context_start_point = seq_len - query_len
+    sparse_seqlen = context_start_point + query_offset
+    sparse_seqlen_masked = tl.where(
+        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
+    )
+    tl.store(
+        out_ptr + query_start + query_offset, sparse_seqlen_masked, mask=query_mask
+    )
+
+
+def generate_sparse_seqlen_triton(
+    seq_lens: torch.Tensor,
+    cu_query_lens: torch.Tensor,
+    topk_token: int,
+    num_tokens: int,
+    max_query_len: int,
+):
+    num_seqs = seq_lens.size(0)
+    out = torch.zeros([num_tokens], dtype=torch.int32, device=seq_lens.device)
+    block_size = 64
+    num_block_per_row = triton.cdiv(max_query_len, block_size)
+    grid = (num_seqs, num_block_per_row)
+    generate_sparse_seqlen_kernel[grid](
+        seq_lens,
+        cu_query_lens,
+        out,
+        topk_token,
+        block_size,
+    )
+    return out
+
+
+@dataclass
+class ROCMAiterMLASparseMetadata(AiterMLAMetadata):
+    """Extends AiterMLAMetadata with sparse-specific fields for decode."""
+
+    # Sparse decode fields
+    sparse_req_id_per_token: torch.Tensor | None = None
+    sparse_topk_tokens: int = 2048
+    sparse_qo_indptr: torch.Tensor | None = None
+    sparse_paged_kv_last_page_len: torch.Tensor | None = None
+    sparse_paged_kv_indices: torch.Tensor | None = None
+    sparse_paged_kv_indptr: torch.Tensor | None = None
+
+
+class ROCMAiterMLASparseBackend(AiterMLABackend):
+    """Sparse MLA backend that inherits prefill (MHA) from AiterMLABackend
+    and uses sparse decode via mla_decode_fwd with topk index selection."""
+
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
@@ -291,64 +300,19 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
     def get_impl_cls() -> type["ROCMAiterMLASparseImpl"]:
         return ROCMAiterMLASparseImpl
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,  # assumed to be 1 for MLA
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
-
-    @classmethod
-    def is_mla(cls) -> bool:
-        return True
-
     @classmethod
     def is_sparse(cls) -> bool:
         return True
 
 
-@dataclass
-class ROCMAiterMLASparseMetadata(AttentionMetadata):
-    num_reqs: int
-    max_query_len: int
-    max_seq_len: int
+class ROCMAiterMLASparseMetadataBuilder(AiterMLAMetadataBuilder):
+    """Metadata builder that inherits prefill + decode building from
+    AiterMLAMetadataBuilder and adds sparse-specific fields for decode."""
 
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    query_start_loc: torch.Tensor
-    slot_mapping: torch.Tensor
-
-    block_table: torch.Tensor
-    req_id_per_token: torch.Tensor
-
-    qo_indptr: torch.Tensor
-    paged_kv_last_page_len: torch.Tensor
-    paged_kv_indices: torch.Tensor
-    paged_kv_indptr: torch.Tensor
-    attn_out_dtype: torch.dtype
-
-    block_size: int = 1
-    topk_tokens: int = 2048
-
-    # Persistent MLA metadata (only populated when persistent mode is enabled,
-    # i.e. when the aiter sparse decode kernel supports work-stealing splits).
-    work_meta_data: torch.Tensor | None = None
-    work_indptr: torch.Tensor | None = None
-    work_info_set: torch.Tensor | None = None
-    reduce_indptr: torch.Tensor | None = None
-    reduce_final_map: torch.Tensor | None = None
-    reduce_partial_map: torch.Tensor | None = None
-
-
-@dataclass
-class ROCMAiterMLASparseMetadataBuilder(
-    AttentionMetadataBuilder[ROCMAiterMLASparseMetadata]
-):
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
         self,
@@ -357,199 +321,252 @@ class ROCMAiterMLASparseMetadataBuilder(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        self.kv_cache_spec = kv_cache_spec
-        self.model_config = vllm_config.model_config
-        self.model_dtype = vllm_config.model_config.dtype
-        parallel_config = vllm_config.parallel_config
-        self.device = device
-        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Override metadata class so parent builder creates our sparse metadata
+        self.metadata_cls = ROCMAiterMLASparseMetadata
 
-        self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
+        # AiterMLAMetadataBuilder.__init__ allocates paged_kv_indices sized for
+        # max_num_reqs * max_model_len pages, assuming kernel_block_size=1 (one
+        # page per token).  With kernel_block_size=64 that is 64× more entries
+        # than needed — and our _build_decode override never uses this buffer at
+        # all.  Releasing it saves ~52 MB per attention layer (≈3 GB total for
+        # DeepSeek-V3.2's ~60 MLA layers per TP rank), which is critical budget
+        # for the indexer's prefill logits allocation.
+        self.paged_kv_indices = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # Sparse-specific fields
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
-        self.max_model_len_tensor = torch.tensor(
-            [self.model_config.max_model_len], device=device, dtype=torch.int32
-        )
-        # this is ignored by `flash_mla_with_kvcache` if indices not None
-        self.dummy_block_table = torch.empty(
-            (1, 1), dtype=torch.int32, device=self.device
-        )
+
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.req_id_per_token_buffer = torch.empty(
-            (vllm_config.scheduler_config.max_num_batched_tokens,),
+            (max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
         )
-        self.qo_indptr = torch.arange(
-            0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
-        )
-        self.paged_kv_last_page_len = torch.ones(
-            max_num_batched_tokens, dtype=torch.int32, device=device
-        )
 
-        # These two needs to be calculated in runtime,
-        # but we still needs to prepare the buffer
-        self.paged_kv_indices = torch.zeros(
+        # Sparse decode uses separate paged_kv tracking for topk indices
+        self.sparse_paged_kv_indices = torch.zeros(
             [max_num_batched_tokens * self.topk_tokens],
             dtype=torch.int32,
             device=device,
         )
-        self.paged_kv_indptr = torch.zeros(
+        self.sparse_paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        self.sparse_qo_indptr = torch.arange(
+            0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
+        )
+        self.sparse_paged_kv_last_page_len = torch.ones(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
 
-        # ----- Persistent MLA metadata buffers -----
-        # The aiter sparse decode kernel supports a "persistent" path that
-        # uses precomputed work-splitting metadata for better load balancing
-        # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
-        #
-        # In the sparse case each query token is its own "batch" entry in the
-        # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
-        # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
-        # so the buffers are large enough for any decode shape we might see.
-        from aiter import dtypes, get_mla_metadata_info_v1
+        # ----- Persistent (work-stealing) MLA decode metadata buffers -----
+        # Mirrors the approach landed in #41990 for the (now-replaced) sparse
+        # backend: when the aiter sparse decode kernel is given precomputed
+        # work-splitting metadata it takes the persistent path, which load-
+        # balances better across CUs for heterogeneous decode batches.
+        # The parent's AiterMLAMetadataBuilder.__init__ already sized the
+        # persistent buffers via get_mla_metadata_info_v1(...) for the
+        # *dense* MLA case (qseqlen <= 1, no is_sparse flag); sparse decode
+        # uses uni_seqlen_qo=1 with is_sparse=True, which produces
+        # different buffer sizes — so we re-allocate here, overriding the
+        # parent's tensors.
+        from aiter import dtypes as _aiter_dtypes
+        from aiter import get_mla_metadata_info_v1
 
-        # Aiter sparse MLA also requires num_heads >= 16 (will be padded by
-        # AiterMLAHelper.get_mla_padded_q in forward).
-        self._num_attention_heads = max(16, self.num_heads)
-
-        q_dtype = self.model_dtype
-        kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
-        if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-            kv_cache_dtype_str = "fp8"
+        self._sparse_num_attention_heads = max(16, self.num_heads)
+        _q_dtype = self.model_config.dtype
+        _cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        if _cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+            _cache_dtype_str = "fp8"
         else:
-            kv_cache_dtype_str = "bf16"
-        kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
+            _cache_dtype_str = "bf16"
+        _kv_dtype = _aiter_dtypes.d_dtypes.get(_cache_dtype_str, _aiter_dtypes.bf16)
 
         (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
+            (work_metadata_size, work_metadata_dtype),
+            (work_indptr_size, work_indptr_dtype),
+            (work_info_set_size, work_info_set_dtype),
+            (reduce_indptr_size, reduce_indptr_dtype),
+            (reduce_final_map_size, reduce_final_map_dtype),
+            (reduce_partial_map_size, reduce_partial_map_dtype),
         ) = get_mla_metadata_info_v1(
             max_num_batched_tokens,
             1,
-            self._num_attention_heads,
-            q_dtype,
-            kv_dtype,
+            self._sparse_num_attention_heads,
+            _q_dtype,
+            _kv_dtype,
             is_sparse=True,
             fast_mode=True,
         )
         self._mla_work_meta_data = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device=device
+            work_metadata_size, dtype=work_metadata_dtype, device=device
         )
         self._mla_work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device=device
+            work_indptr_size, dtype=work_indptr_dtype, device=device
         )
         self._mla_work_info_set = torch.empty(
-            work_info_set_size, dtype=work_info_set_type, device=device
+            work_info_set_size, dtype=work_info_set_dtype, device=device
         )
         self._mla_reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+            reduce_indptr_size, dtype=reduce_indptr_dtype, device=device
         )
         self._mla_reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+            reduce_final_map_size,
+            dtype=reduce_final_map_dtype,
+            device=device,
         )
         self._mla_reduce_partial_map = torch.empty(
             reduce_partial_map_size,
-            dtype=reduce_partial_map_type,
+            dtype=reduce_partial_map_dtype,
             device=device,
         )
 
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> ROCMAiterMLASparseMetadata:
+    def _build_sparse_fields(self, common_attn_metadata):
+        """Build sparse-specific metadata fields for decode."""
         num_tokens = common_attn_metadata.num_actual_tokens
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
             np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
         )
-        # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
         self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             torch.from_numpy(req_id_per_token), non_blocking=True
         )
-        query_lens = (
-            common_attn_metadata.query_start_loc[1:]
-            - common_attn_metadata.query_start_loc[:-1]
-        )
+
+        self.sparse_paged_kv_indices.fill_(0)
+        self.sparse_paged_kv_indptr.fill_(0)
+
         seq_lens = common_attn_metadata.seq_lens
         sparse_seqlen = generate_sparse_seqlen_triton(
-            query_lens,
             seq_lens,
             common_attn_metadata.query_start_loc,
             self.topk_tokens,
             num_tokens,
             common_attn_metadata.max_query_len,
         )
+        torch.cumsum(
+            sparse_seqlen, dim=0, out=self.sparse_paged_kv_indptr[1 : num_tokens + 1]
+        )
+        self.sparse_paged_kv_indptr[num_tokens + 1 :].fill_(
+            self.sparse_paged_kv_indptr[num_tokens]
+        )
 
-        torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
-        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
+        return {
+            "sparse_req_id_per_token": self.req_id_per_token_buffer[:num_tokens],
+            "sparse_topk_tokens": self.topk_tokens,
+            "sparse_qo_indptr": self.sparse_qo_indptr[: num_tokens + 1],
+            "sparse_paged_kv_last_page_len": (
+                self.sparse_paged_kv_last_page_len[:num_tokens]
+            ),
+            "sparse_paged_kv_indices": (
+                self.sparse_paged_kv_indices[: num_tokens * self.topk_tokens]
+            ),
+            "sparse_paged_kv_indptr": (self.sparse_paged_kv_indptr[: num_tokens + 1]),
+        }
 
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
-        qo_indptr = self.qo_indptr[: num_tokens + 1]
-        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+    def _build_decode(
+        self,
+        block_table_tensor: torch.Tensor,
+        seq_lens_device: torch.Tensor,
+        max_seq_len: int,
+        query_start_loc_cpu: torch.Tensor,
+        query_start_loc_device: torch.Tensor,
+        num_decode_tokens: int,
+        dcp_tot_seq_lens_device: torch.Tensor | None,
+    ) -> AiterMLADecodeMetadata:
+        # The parent's _build_decode calls _copy_page_indices_kernel which
+        # iterates seq_len times per row in block_table.  With kernel_block_size
+        # = 64 each row has only ceil(seq_len/64) valid entries → OOB GPU read.
+        # Our forward_mqa only reads attn_metadata.decode.block_table directly;
+        # it never uses paged_kv_indices or the AITER work metadata.
+        # Return a minimal decode metadata with just the fields we need.
+        # attn_out_dtype is the model dtype (e.g. bf16): the dispatcher may
+        # have pre-quantised q to fp8 before forward_mqa, but AITER mla_reduce_v1
+        # only emits bf16/fp16, so we cannot use q.dtype as the output buffer
+        # dtype in _forward_sparse_mla.
+        return AiterMLADecodeMetadata(
+            block_table=block_table_tensor,
+            seq_lens=seq_lens_device,
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            attn_out_dtype=self.decode_attn_out_dtype,
+        )
 
-        # ----- Compute persistent MLA metadata -----
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        # Build sparse fields first
+        sparse_fields = self._build_sparse_fields(common_attn_metadata)
+
+        # Build standard prefill + decode metadata via parent
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+
+        # Attach sparse fields to metadata
+        for key, value in sparse_fields.items():
+            setattr(metadata, key, value)
+
+        # ----- Populate persistent (work-stealing) MLA decode metadata -----
         # The aiter sparse decode kernel uses qseqlen=1 (each query token is
-        # treated as its own batch entry), so persistent metadata can always
-        # be precomputed here. The kernel switches to the persistent
-        # work-stealing path automatically when work_meta_data is non-None.
-        from aiter import get_mla_metadata_v1
+        # its own batch entry), so the persistent path is always applicable.
+        # Mirrors #41990's approach but keyed off the sparse_* indptr buffers
+        # produced above. On any failure we leave work_meta_data=None and the
+        # kernel falls back to its non-persistent path.
+        #
+        # Pass DECODE-ONLY indptrs to the populator.  The dispatcher places
+        # decode tokens at q[:num_decode_tokens] and only those go through
+        # forward_mqa -> mla_decode_fwd; the persistent populator uses the
+        # indptr length as the batch size for work-splitting, so passing
+        # the full prefill+decode indptr would schedule work for prefill
+        # positions whose KV indices are populated as -1 by the indexer.
+        num_decode_tokens = getattr(metadata, "num_decode_tokens", 0)
+        if num_decode_tokens > 0:
+            try:
+                from aiter import get_mla_metadata_v1
 
-        get_mla_metadata_v1(
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_last_page_len,
-            self._num_attention_heads,
-            1,
-            True,
-            self._mla_work_meta_data,
-            self._mla_work_info_set,
-            self._mla_work_indptr,
-            self._mla_reduce_indptr,
-            self._mla_reduce_final_map,
-            self._mla_reduce_partial_map,
-            page_size=1,
-            kv_granularity=16,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=True,
-        )
+                get_mla_metadata_v1(
+                    metadata.sparse_qo_indptr[: num_decode_tokens + 1],
+                    metadata.sparse_paged_kv_indptr[: num_decode_tokens + 1],
+                    metadata.sparse_paged_kv_last_page_len[:num_decode_tokens],
+                    self._sparse_num_attention_heads,
+                    1,
+                    True,
+                    self._mla_work_meta_data,
+                    self._mla_work_info_set,
+                    self._mla_work_indptr,
+                    self._mla_reduce_indptr,
+                    self._mla_reduce_final_map,
+                    self._mla_reduce_partial_map,
+                    page_size=1,
+                    kv_granularity=16,
+                    max_seqlen_qo=1,
+                    uni_seqlen_qo=1,
+                    fast_mode=True,
+                    # Buffer sizes were declared with is_sparse=True via
+                    # get_mla_metadata_info_v1; the populator must write
+                    # the matching sparse layout, otherwise the persistent
+                    # sparse decode kernel reads bogus work-info entries
+                    # and faults with a GPU memory access fault.  topk
+                    # defaults to -1 (dense layout) on the populator
+                    # side, so we must pass it explicitly to keep the
+                    # populator and the buffer sizing consistent.
+                    topk=self.topk_tokens,
+                )
+                metadata.work_meta_data = self._mla_work_meta_data
+                metadata.work_indptr = self._mla_work_indptr
+                metadata.work_info_set = self._mla_work_info_set
+                metadata.reduce_indptr = self._mla_reduce_indptr
+                metadata.reduce_final_map = self._mla_reduce_final_map
+                metadata.reduce_partial_map = self._mla_reduce_partial_map
+            except Exception as exc:  # noqa: BLE001
+                logger.warning_once(
+                    "ROCMAiterMLASparseMetadataBuilder: persistent MLA "
+                    "metadata population failed (%s); decode will fall "
+                    "back to the non-persistent kernel path.",
+                    exc,
+                )
 
-        metadata = ROCMAiterMLASparseMetadata(
-            num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            block_table=common_attn_metadata.block_table_tensor,
-            req_id_per_token=req_id_per_token,
-            block_size=self.kv_cache_spec.block_size,
-            attn_out_dtype=self.model_dtype,
-            topk_tokens=self.topk_tokens,
-            qo_indptr=qo_indptr,
-            paged_kv_last_page_len=paged_kv_last_page_len,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_indptr=paged_kv_indptr,
-            work_meta_data=self._mla_work_meta_data,
-            work_indptr=self._mla_work_indptr,
-            work_info_set=self._mla_work_info_set,
-            reduce_indptr=self._mla_reduce_indptr,
-            reduce_final_map=self._mla_reduce_final_map,
-            reduce_partial_map=self._mla_reduce_partial_map,
-        )
         return metadata
 
 
@@ -582,7 +599,11 @@ def reference_mla_sparse_prefill(
     return (result, lse)
 
 
-class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata]):
+class ROCMAiterMLASparseImpl(AiterMLAImpl):
+    """Sparse MLA impl that inherits forward_mha (compute-bound prefill via
+    flash_attn_varlen_func) from AiterMLAImpl/MLACommonImpl, and overrides
+    forward_mqa for sparse decode via mla_decode_fwd with topk indices."""
+
     def __init__(
         self,
         num_heads: int,
@@ -596,44 +617,95 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
-        topk_indice_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
         **mla_args,
     ) -> None:
-        AiterMLAHelper.check_num_heads_validity(num_heads)
-
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = kv_cache_dtype
-        self.kv_lora_rank: int = mla_args["kv_lora_rank"]
-        self.softmax_scale = scale
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            kv_cache_dtype=kv_cache_dtype,
+            logits_soft_cap=logits_soft_cap,
+            attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            indexer=indexer,
+            **mla_args,
+        )
+        # Sparse-specific: get the topk indices buffer from the indexer
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
+        self._decode_out: torch.Tensor | None = None
 
-    def _forward_mla(
+    def _forward_sparse_mla(
         self,
         layer: AttentionLayer,
         q: torch.Tensor,  # [sq, heads, d_qk]
-        kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
         attn_metadata: ROCMAiterMLASparseMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
-        mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(self.num_heads)
-        output = torch.empty(
-            [num_tokens, mla_num_heads, self.kv_lora_rank],
-            dtype=attn_metadata.attn_out_dtype,
-            device=q.device,
-        )
+        # The dispatcher in mla_attention.py may have pre-quantised q to fp8
+        # before forward_mqa (when self.supports_quant_query_input is true
+        # and the cache dtype is fp8), so q.dtype is unsafe as the output
+        # buffer dtype: AITER's mla_reduce_v1 only emits bf16/fp16.  Use the
+        # model dtype the builder cached on decode metadata instead.
+        attn_out_dtype = attn_metadata.decode.attn_out_dtype
+        # q may have been padded by AiterMLAHelper.get_mla_padded_q in the
+        # caller (forward_mqa) so num_heads >= 16 for the AITER kernel.
+        # Size the output buffer to whatever shape q was actually called
+        # with; the caller is responsible for unpadding via
+        # get_mla_unpadded_o.
+        kernel_num_heads = q.shape[1]
 
-        # Build kwargs and forward the persistent MLA metadata when it has
-        # been computed. The aiter mla_decode_fwd switches to its
-        # work-stealing persistent kernel path when work_meta_data is given.
-        mla_kwargs: dict = dict(
-            q_scale=layer._q_scale,
-            kv_scale=layer._k_scale,
-        )
+        is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv:
+            fp8_dtype = current_platform.fp8_dtype()
+            q_scale = layer._q_scale if layer is not None else None
+            k_scale = layer._k_scale if layer is not None else None
+            q = q.to(fp8_dtype)
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(fp8_dtype)
+
+        # mla_decode_fwd uses page_size=1 (per-token paging) internally.
+        # When kernel_block_size > 1, the KV cache shape is
+        # [num_pages, block_size, head_size].  Flatten to
+        # [num_pages * block_size, 1, head_size] so that the flat token
+        # indices in sparse_paged_kv_indices correctly address each token.
+        if kv_c_and_k_pe_cache.shape[1] != 1:
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.reshape(
+                -1, 1, kv_c_and_k_pe_cache.shape[-1]
+            )
+
+        # Slice sparse CSR fields to num_tokens (= num_decode_tokens).
+        # _build_sparse_fields builds these for num_actual_tokens (prefill+decode),
+        # but forward_mqa only handles decode tokens (q.shape[0]).  In a mixed
+        # prefill+decode batch, passing the full qo_indptr/kv_indptr would set
+        # bs = num_actual_tokens while o has num_decode_tokens rows, causing the
+        # stage2 kernel to write o[cur_qo] for cur_qo >= total_s → GPU OOB fault.
+        qo_indptr = attn_metadata.sparse_qo_indptr[: num_tokens + 1]
+        kv_indptr = attn_metadata.sparse_paged_kv_indptr[: num_tokens + 1]
+        kv_last_page_len = attn_metadata.sparse_paged_kv_last_page_len[:num_tokens]
+
+        if (
+            self._decode_out is None
+            or self._decode_out.shape[0] < num_tokens
+            or self._decode_out.shape[1] != kernel_num_heads
+            or self._decode_out.dtype != attn_out_dtype
+        ):
+            self._decode_out = torch.zeros(
+                [num_tokens, kernel_num_heads, self.kv_lora_rank],
+                dtype=attn_out_dtype,
+                device=q.device,
+            )
+        output = self._decode_out[:num_tokens]
+
+        # Forward persistent (work-stealing) decode metadata when the
+        # builder populated it.  The kernel falls back to its non-
+        # persistent path automatically when work_meta_data is absent.
+        mla_kwargs: dict = {}
         if attn_metadata.work_meta_data is not None:
             mla_kwargs.update(
                 work_meta_data=attn_metadata.work_meta_data,
@@ -644,20 +716,41 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
                 reduce_partial_map=attn_metadata.reduce_partial_map,
             )
 
-        rocm_aiter_ops.mla_decode_fwd(
-            q,
-            kv_c_and_k_pe_cache,
-            output,
-            self.scale,
-            attn_metadata.qo_indptr,
-            1,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            attn_metadata.paged_kv_last_page_len,
-            **mla_kwargs,
-        )
+        # NOTE: q_scale / kv_scale MUST be passed as keyword arguments.
+        # rocm_aiter_ops.mla_decode_fwd has positional slot 10 =
+        # logit_cap (float, default 0.0); passing q_scale / k_scale
+        # positionally would bind a Tensor(1.0) to logit_cap and
+        # trigger AITER's "logit_cap=1.0 is not support yet" error.
+        if is_fp8_kv:
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                output,
+                self.scale,
+                qo_indptr,
+                1,
+                kv_indptr,
+                attn_metadata.sparse_paged_kv_indices,
+                kv_last_page_len,
+                q_scale=q_scale,
+                kv_scale=k_scale,
+                **mla_kwargs,
+            )
+        else:
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                output,
+                self.scale,
+                qo_indptr,
+                1,
+                kv_indptr,
+                attn_metadata.sparse_paged_kv_indices,
+                kv_last_page_len,
+                **mla_kwargs,
+            )
 
-        return AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
+        return output
 
     def forward_mqa(
         self,
@@ -666,39 +759,55 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         attn_metadata: ROCMAiterMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
-        # MQA 576/512 approach for both prefill and decode
-
-        # Concatenate q if it's a tuple (ql_nope, q_pe)
+        # For sparse decode, use MQA 576/512 approach with topk indices.
+        #
+        # The MLA dispatcher (vllm/model_executor/layers/attention/mla_attention.py
+        # forward()) places decode tokens at the front of the batch and passes
+        # mqa_q = q[:num_decode_tokens] here, so q.shape[0] == num_decode_tokens.
+        # Everything below MUST be decode-sliced — using
+        # attn_metadata.num_actual_tokens reads into prefill positions where
+        # topk_indices_buffer is uninitialised (the indexer's prefill skip)
+        # and where req_id_per_token would index past the end of
+        # decode.block_table (it only has rows for decode requests).
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
-        num_actual_toks = attn_metadata.num_actual_tokens
+        # AITER MLA decode kernels require num_heads >= 16 (= AITER's MLA
+        # head-tile size).  For configs with fewer heads (e.g. heavily
+        # tensor-parallelised small models), the helper repeat-interleaves
+        # along dim=1 to bring heads up to the tile size; for DSV3.2 with
+        # 128 heads this is a no-op.  Match the idiom used by the dense
+        # AiterMLAImpl.forward_mqa we inherit so the sparse decode path
+        # is safe in both regimes.
+        q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
 
-        # Get topk indices
+        num_decode_tokens = q.shape[0]
+        if num_decode_tokens == 0:
+            return q.new_empty((0, self.num_heads, self.kv_lora_rank)), None
+
+        # Get topk indices for the decode portion only.
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        topk_indices = self.topk_indices_buffer[:num_decode_tokens]
 
+        assert attn_metadata.decode is not None
+
+        # Convert per-request topk token indices to global flat KV-cache
+        # indices, writing the RAGGED output directly into
+        # sparse_paged_kv_indices (which mla_decode_fwd consumes).
         triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
+            attn_metadata.sparse_req_id_per_token[:num_decode_tokens],
+            attn_metadata.decode.block_table,
             topk_indices,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            attn_metadata.sparse_paged_kv_indptr[: num_decode_tokens + 1],
+            attn_metadata.sparse_paged_kv_indices,
+            BLOCK_SIZE=64,  # block_size=64 for this backend
+            NUM_TOPK_TOKENS=attn_metadata.sparse_topk_tokens,
         )
 
-        # write the latent and rope to kv cache
-        fp8_attention = self.kv_cache_dtype.startswith("fp8")
-        if fp8_attention:
-            original_q_shape = q.shape
-            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
-            q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
-            q = q.view(original_q_shape)
-        mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
-        attn_out = self._forward_mla(
-            layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata
+        attn_out = self._forward_sparse_mla(
+            layer, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
         )
 
-        return attn_out, None
+        # Unpad heads if get_mla_padded_q replicated them above.  For
+        # num_heads >= 16 (DSV3.2) this is a no-op.
+        return AiterMLAHelper.get_mla_unpadded_o(self.num_heads, attn_out), None

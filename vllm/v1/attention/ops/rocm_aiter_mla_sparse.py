@@ -667,48 +667,14 @@ def rocm_aiter_sparse_attn_indexer_native(
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
-        prefill_metadata = layer_attn_metadata.prefill
-        assert prefill_metadata is not None
-        for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=device,
-                dtype=fp8_dtype,
-            )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=device,
-                dtype=torch.uint8,
-            )
-            if _ON_GFX942:
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-            else:
-                cp_gather_indexer_k_quant_cache_triton(
-                    kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                    token_to_seq=chunk.token_to_seq,
-                )
-
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
-            topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
+        # Sparse MLA prefill is routed through the dense AITER MHA path
+        # (forward_mha -> mla_prefill_ps_asm_fwd on gfx950, varlen fallback
+        # otherwise) by the refactored ROCMAiterMLASparseImpl, so prefill
+        # rows of topk_indices_buffer are never consumed.  Skip the
+        # O(q_tokens * kv_tokens) logits build that previously populated
+        # them; this also avoids the OOM hazard the prefill mqa-logits
+        # tensor poses on long-context requests.
+        pass
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
