@@ -64,14 +64,26 @@ if __name__ == "__main__":
     hipified_sources = []
     for source in args.sources:
         s_abs = os.path.abspath(source)
-        hipified_s_abs = (
-            hipify_result[s_abs].hipified_path
-            if (
-                s_abs in hipify_result
-                and hipify_result[s_abs].hipified_path is not None
-            )
-            else s_abs
-        )
+        if (
+            s_abs in hipify_result
+            and hipify_result[s_abs].hipified_path is not None
+        ):
+            hipified_s_abs = hipify_result[s_abs].hipified_path
+        else:
+            # When hipify finds nothing to convert (already-HIP-native sources
+            # like csrc/rocm/attention.cu), torch's hipify_python keeps the
+            # original .cu name. cmake/utils.cmake assumes every .cu becomes
+            # a .hip and lists it as a BYPRODUCT; without the file the build
+            # fails with "no such file or directory: ...attention.hip". Copy
+            # the .cu to the .hip path so the compile step finds it.
+            hipified_s_abs = s_abs
+            if source.endswith(".cu"):
+                rel = os.path.relpath(s_abs, args.project_dir)
+                hip_rel = rel[:-3] + ".hip"
+                out_path = os.path.join(args.output_dir, hip_rel)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                shutil.copy2(s_abs, out_path)
+                hipified_s_abs = out_path
         hipified_sources.append(hipified_s_abs)
 
     assert len(hipified_sources) == len(args.sources)

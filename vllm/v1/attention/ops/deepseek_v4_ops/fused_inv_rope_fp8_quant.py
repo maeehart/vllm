@@ -37,6 +37,7 @@ def _fused_inv_rope_fp8_quant_per_head(
     ROPE_START: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
+    USE_FNUZ: tl.constexpr = False,
 ):
     # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
     pid_token = tl.program_id(0).to(tl.int64)
@@ -105,7 +106,11 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    x_clamped = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
+    if USE_FNUZ:
+        x_quant = x_clamped.to(tl.float8e4b8)
+    else:
+        x_quant = x_clamped.to(tl.float8e4nv)
 
     fp8_base = (
         fp8_ptr
@@ -179,7 +184,10 @@ def fused_inv_rope_fp8_quant(
     num_scale_blocks = d // quant_group_size
     chunks_per_head = head_dim // quant_group_size
 
-    fp8_dtype = torch.float8_e4m3fn
+    # gfx942 (MI300X) Triton lowers `tl.float8e4nv` casts to FNUZ FP8 on
+    # FNUZ-only hardware. Keep the buffer dtype and saturation max consistent
+    # with what the encoder writes so `fp8_einsum` decodes with matching bias.
+    fp8_dtype = current_platform.fp8_dtype()
     fp8_max = torch.finfo(fp8_dtype).max
 
     tma_aligned_T = get_tma_aligned_size(num_tokens, 4)
@@ -230,7 +238,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_buf = torch.empty(
         (n_groups, num_tokens, d),
-        dtype=torch.float8_e4m3fn,
+        dtype=current_platform.fp8_dtype(),
         device=o.device,
     )
     scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
@@ -266,6 +274,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         ROPE_START=rope_start,
         HALF_ROPE=half_rope,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
+        USE_FNUZ=current_platform.is_fp8_fnuz(),
         num_stages=1,
         **pdl_kwargs,
         num_warps=1,
@@ -292,7 +301,7 @@ def _fused_inv_rope_fp8_quant_kernel_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_buf = torch.empty(
         (n_groups, num_tokens, d),
-        dtype=torch.float8_e4m3fn,
+        dtype=current_platform.fp8_dtype(),
         device=o.device,
     )
     scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
