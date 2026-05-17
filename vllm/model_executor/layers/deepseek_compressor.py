@@ -368,11 +368,16 @@ class DeepseekCompressor(nn.Module):
             COMPRESS_RATIO=self.compress_ratio,
             OVERLAP=self.overlap,
             ROPE_HEAD_DIM=self.rope_head_dim,
-            FP8_MAX=448.0,
+            # gfx942 (MI300X) Triton lowers `tl.float8e4nv` casts to FNUZ FP8
+            # on hardware that only supports FNUZ MFMA. Keep the encoder and
+            # decoder symmetric on FNUZ-only platforms by switching both the
+            # max value (240.0 vs 448.0) and the dtype the kernel casts to.
+            FP8_MAX=240.0 if current_platform.is_fp8_fnuz() else 448.0,
             QUANT_BLOCK=self._quant_block,
             TOKEN_STRIDE=self._token_stride,
             SCALE_DIM=self._scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
+            USE_FNUZ=current_platform.is_fp8_fnuz(),
             num_warps=self._num_warps,
             **pdl_kwargs,
         )
