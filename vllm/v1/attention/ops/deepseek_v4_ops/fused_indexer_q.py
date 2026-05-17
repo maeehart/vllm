@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
@@ -88,6 +89,8 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_head_scale,
     index_weights_out_ptr,
     index_weights_out_stride,
+    FP8_MAX: tl.constexpr = 448.0,
+    USE_FNUZ: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -128,7 +131,7 @@ def _fused_indexer_q_rope_quant_kernel(
         nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
         x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
-    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
     # Store quantized values to index_q_fp8
@@ -136,19 +139,35 @@ def _fused_indexer_q_rope_quant_kernel(
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
-        tl.store(
-            fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
-        )
+        if USE_FNUZ:
+            tl.store(
+                fp8_base_ptr + nope_offset,
+                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4b8),
+            )
+        else:
+            tl.store(
+                fp8_base_ptr + nope_offset,
+                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
+            )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    tl.store(
-        fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
-    )
-    tl.store(
-        fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
-    )
+    if USE_FNUZ:
+        tl.store(
+            fp8_rot_base + half_offset * 2,
+            tl.div_rn(r_even, index_q_scale).to(tl.float8e4b8),
+        )
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            tl.div_rn(r_odd, index_q_scale).to(tl.float8e4b8),
+        )
+    else:
+        tl.store(
+            fp8_rot_base + half_offset * 2,
+            tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
+        )
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
+        )
 
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
@@ -397,7 +416,14 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
-    index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+    # gfx942 (MI300X) Triton lowers `tl.float8e4nv` casts to FNUZ FP8 on
+    # FNUZ-only hardware; keep the tensor dtype, encoder cast, and FP8_MAX in
+    # sync so encoder bytes match what the AITER/Triton MQA-logits reader will
+    # interpret them as.
+    use_fnuz = current_platform.is_fp8_fnuz()
+    fp8_dtype = torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+    fp8_max = 240.0 if use_fnuz else 448.0
+    index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
         positions,
         index_q,
@@ -416,6 +442,8 @@ def fused_indexer_q_rope_quant(
         index_weights_head_scale,
         index_weights_out,
         index_weights_out.stride(0),
+        FP8_MAX=fp8_max,
+        USE_FNUZ=use_fnuz,
         num_warps=1,  # TODO: Tune this
     )
     return index_q_fp8, index_weights_out
