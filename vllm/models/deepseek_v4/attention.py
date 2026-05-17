@@ -963,6 +963,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv = workspace_manager.get_simultaneous(
             ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
         )[0]
+        # The workspace allocator returns uninitialized memory and is shared
+        # across requests + other layers. dequantize_and_gather_k_cache only
+        # writes the compressed-K prefix (rows [0, seq_len/compress_ratio))
+        # and the SWA window (rows [N, N+gather_lens)) for each chunk row,
+        # leaving holes in the M dimension. flash_mla_sparse_fwd then reads
+        # `kv.view(-1, 1, head_dim)` using top-k indices that can reference
+        # those holes for very short sequences, causing data-dependent
+        # non-determinism across otherwise-identical temperature=0 requests.
+        # Zero once per call so the holes are deterministic (and harmless if
+        # ever indexed). The cost is one bf16 zero per chunk worth of
+        # workspace, which is dwarfed by the gather + attention themselves.
+        kv.zero_()
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
