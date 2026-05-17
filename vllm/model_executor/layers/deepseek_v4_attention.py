@@ -288,8 +288,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
+        # NOTE: We use ``torch.zeros`` (not ``torch.empty``) because the
+        # attention op writes only the first ``n_local_heads`` rows of the
+        # padded-heads dimension, leaving the trailing rows uninitialized.
+        # Even though Python slices them off below (``o = o_padded[:, :
+        # n_local_heads, :]``), the per-element semantics of the downstream
+        # FP8 quant + einsum on ROCm are sensitive to whether the FP8 cast
+        # of the discarded slots produces NaNs that contaminate adjacent
+        # warp reductions through cross-lane shuffles. Zeroing keeps the
+        # observable computation deterministic across requests.
         num_tokens = hidden_states.shape[0]
-        o_padded = torch.empty(
+        o_padded = torch.zeros(
             (num_tokens, self.padded_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
