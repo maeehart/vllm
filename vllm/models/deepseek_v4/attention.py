@@ -971,6 +971,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
+                # The compressed-K encoder (Triton _fused_kv_compress_...)
+                # writes bytes via tl.float8e4nv with FP8_MAX=448.0 regardless
+                # of platform. The SWA-side C++ encoder, by contrast, switches
+                # to FNUZ on gfx942, so only the SWA decode needs use_fnuz=True.
+                # Matching the compressed encoder means use_fnuz=False here.
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
@@ -979,7 +984,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     block_table=block_table[chunk_start:chunk_end],
                     block_size=attn_metadata.block_size // self.compress_ratio,
                     offset=0,
-                    use_fnuz=current_platform.is_fp8_fnuz(),
+                    use_fnuz=False,
                 )
 
             # Gather SWA KV
