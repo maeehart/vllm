@@ -8,6 +8,7 @@ import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionLayer,
@@ -686,6 +687,12 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
                 block_table = attn_metadata.block_table[num_decodes:]
+                # The compressed-K encoder (Triton _fused_kv_compress_norm_...
+                # in fused_compress_quant_cache.py) writes bytes via
+                # tl.float8e4nv with FP8_MAX=448.0 regardless of platform.
+                # The SWA-side C++ encoder, by contrast, switches to FNUZ on
+                # gfx942 (PR #42893), so the two caches need different
+                # use_fnuz settings even on the same MI300X.
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
@@ -694,6 +701,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                     block_table=block_table[chunk_start:chunk_end],
                     block_size=attn_metadata.block_size // layer.compress_ratio,
                     offset=0,
+                    use_fnuz=False,
                 )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
@@ -705,6 +713,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
                 offset=N,
+                use_fnuz=current_platform.is_fp8_fnuz(),
             )
 
             query_start = (
