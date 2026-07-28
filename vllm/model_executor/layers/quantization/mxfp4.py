@@ -495,11 +495,11 @@ def _use_k3_situ_aiter(moe: FusedMoEConfig) -> bool:
         return False
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
 
     return (
         rocm_aiter_ops.is_fused_moe_enabled()
-        and on_gfx950()
+        and (on_gfx950() or on_gfx942())
         and moe.activation == MoEActivation.SITU
         and moe.activation_situ_linear_beta is not None
         and rocm_aiter_ops.get_aiter_activation_type("situ") is not None
@@ -816,9 +816,79 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer=layer,
             )
 
+    def _setup_kernel_k3_situ_gfx942(self, layer) -> None:
+        # gfx942 has no native MXFP4 matmul. Convert the MXFP4 (fp4x2 + e8m0)
+        # expert weights to int4 (a16wi4) with a groupwise (32) bf16 scale at
+        # load, then preshuffle the same way aiter's a16wi4 op test does, so
+        # aiter.fused_moe (per_1x32, i4x2 weights) dispatches the int4 SiTU
+        # stage1 FlyDSL kernel. Activations stay bf16 (no activation quant).
+        from aiter import dtypes as _adt
+        from aiter.ops.quant import per_1x32_i4_quant
+        from aiter.ops.shuffle import (
+            pack_int8_to_packed_int4,
+            shuffle_scale_for_int4,
+            shuffle_weight,
+        )
+        from aiter.utility import fp4_utils
+
+        fp4_dtype = torch.float4_e2m1fn_x2
+        e8m0_dtype = torch.float8_e8m0fnu
+
+        def _convert(w_param, s_param):
+            # w_param: [E, N, K//2] uint8 (packed mxfp4)
+            # s_param: [E, N, K//32] e8m0
+            w_f32 = fp4_utils.mxfp4_to_f32(w_param.data.view(fp4_dtype))
+            s_f32 = fp4_utils.e8m0_to_f32(s_param.data.view(e8m0_dtype))
+            E, N, K = w_f32.shape
+            w_deq = (
+                (w_f32.view(E, N, K // 32, 32) * s_f32.view(E, N, K // 32, 1))
+                .view(E, N, K)
+                .to(torch.bfloat16)
+            )
+            del w_f32, s_f32
+            w_qt, w_scale = per_1x32_i4_quant(w_deq)
+            del w_deq
+            w_qt = w_qt.view(_adt.i4x2).view(E, N, K)
+            w_packed = pack_int8_to_packed_int4(
+                shuffle_weight(w_qt.view(_adt.i8), (16, 16))
+            )
+            w_packed = w_packed.view(E, N, K // 2).view(_adt.i4x2)
+            w_scale_shuf = (
+                shuffle_scale_for_int4(w_scale, group_size=32).view(-1).contiguous()
+            )
+            del w_qt, w_scale
+            torch.cuda.empty_cache()
+            return w_packed, w_scale_shuf
+
+        w13, w13_scale = _convert(layer.w13_weight, layer.w13_weight_scale)
+        w2, w2_scale = _convert(layer.w2_weight, layer.w2_weight_scale)
+
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self.moe_quant_config is not None and self.experts_cls is not None:
+            self.moe_kernel = make_mxfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                mxfp4_backend=self.mxfp4_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+                layer=layer,
+            )
+
     def process_weights_after_loading(self, layer):
         if self.is_k3_situ_aiter:
-            self._setup_kernel_k3_situ(layer)
+            from vllm.platforms.rocm import on_gfx942
+
+            if on_gfx942():
+                self._setup_kernel_k3_situ_gfx942(layer)
+            else:
+                self._setup_kernel_k3_situ(layer)
             return
 
         w13 = layer.w13_weight
