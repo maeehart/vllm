@@ -12,9 +12,8 @@ ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 # Kimi-K3 needs AITER >= v0.1.19: the vision tower imports
 # aiter.ops.triton.conv.conv2d, which does not exist in v0.1.16.post5, and
 # v0.1.19 is also the first tag carrying the tuned Kimi-K3 SiTUv2 MoE kernels.
-# Points at the fork so gfx942 tuned configs can be added on top.
-ARG AITER_BRANCH="maeehart/kimi-k3-gfx942-tuning"
-ARG AITER_REPO="https://github.com/maeehart/aiter.git"
+ARG AITER_BRANCH="v0.1.19"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
