@@ -724,7 +724,91 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer=layer,
             )
 
+    def _setup_kernel_k3_situ_gfx942(self, layer: RoutedExperts) -> None:
+        # gfx942 has no native MXFP4 matmul. Convert the weights to groupwise
+        # int4 once at load time for AITER's existing bf16 x int4 FlyDSL path.
+        from aiter import dtypes as aiter_dtypes
+        from aiter.ops.quant import per_1x32_i4_quant
+        from aiter.ops.shuffle import (
+            pack_int8_to_packed_int4,
+            shuffle_scale_for_int4,
+            shuffle_weight,
+        )
+        from aiter.utility import fp4_utils
+
+        fp4_dtype = torch.float4_e2m1fn_x2
+        e8m0_dtype = torch.float8_e8m0fnu
+
+        def convert(
+            weight: torch.nn.Parameter,
+            scale: torch.nn.Parameter,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            weight_f32 = fp4_utils.mxfp4_to_f32(weight.data.view(fp4_dtype))
+            scale_f32 = fp4_utils.e8m0_to_f32(scale.data.view(e8m0_dtype))
+            num_experts, output_size, input_size = weight_f32.shape
+            weight_bf16 = (
+                (
+                    weight_f32.view(
+                        num_experts, output_size, input_size // 32, 32
+                    )
+                    * scale_f32.view(
+                        num_experts, output_size, input_size // 32, 1
+                    )
+                )
+                .view(num_experts, output_size, input_size)
+                .to(torch.bfloat16)
+            )
+            del weight_f32, scale_f32
+
+            weight_int4, weight_scale = per_1x32_i4_quant(weight_bf16)
+            del weight_bf16
+            weight_int4 = weight_int4.view(aiter_dtypes.i4x2).view(
+                num_experts, output_size, input_size
+            )
+            weight_packed = pack_int8_to_packed_int4(
+                shuffle_weight(weight_int4.view(aiter_dtypes.i8), (16, 16))
+            )
+            weight_packed = weight_packed.view(
+                num_experts, output_size, input_size // 2
+            ).view(aiter_dtypes.i4x2)
+            weight_scale = (
+                shuffle_scale_for_int4(weight_scale, group_size=32)
+                .view(-1)
+                .contiguous()
+            )
+            return weight_packed, weight_scale
+
+        w13, w13_scale = convert(layer.w13_weight, layer.w13_weight_scale)
+        w2, w2_scale = convert(layer.w2_weight, layer.w2_weight_scale)
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self.moe_quant_config is not None and self.experts_cls is not None:
+            self.moe_kernel = make_mxfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                mxfp4_backend=self.mxfp4_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+                layer=layer,
+            )
+
     def process_weights_after_loading(self, layer):
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm() and self.moe.activation == MoEActivation.SITU:
+            from vllm.platforms.rocm import on_gfx942
+
+            if on_gfx942():
+                self._setup_kernel_k3_situ_gfx942(layer)
+                return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
