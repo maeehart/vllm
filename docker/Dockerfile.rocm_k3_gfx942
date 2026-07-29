@@ -21,8 +21,8 @@ FROM ${BASE_IMAGE}
 
 ARG AITER_REPO="https://github.com/maeehart/aiter.git"
 ARG AITER_COMMIT="c63defd4cad0d4a247c66072aa2156572a25eea8"
-# Add gfx950 to serve both MI325 and MI355 from one image, at the cost of
-# roughly double the kernel prebuild time.
+# Default to gfx942 only. Override GPU_ARCHS at build time when another
+# ROCm architecture needs AITER kernels prebuilt in the image.
 ARG GPU_ARCHS="gfx942"
 
 # aiter cannot be imported here to verify the install: rocminfo needs /dev/kfd
