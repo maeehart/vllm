@@ -10,20 +10,17 @@
 # MORI, because those are pinned to the same commits. This layer swaps only
 # AITER on top of an image already built by Dockerfile.rocm.
 #
-# Build:
+# Build (two-stage):
+#   docker build -f docker/Dockerfile.rocm --target vllm-openai -t <vllm-image> .
 #   docker build -f docker/Dockerfile.rocm_k3_gfx942 \
-#     --build-arg BASE_IMAGE=<image built from docker/Dockerfile.rocm> \
+#     --build-arg BASE_IMAGE=<vllm-image> \
 #     -t <tag> .
-#
-# Serving Kimi-K3 on gfx942 additionally needs VLLM_ROCM_USE_AITER_MLA=0. The
-# AITER MLA backend wins selection at TP8 (12 heads per rank) and then asserts
-# inside a Gluon kernel that is gfx950-only.
 
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_BRANCH="v0.1.19"
+ARG AITER_REPO="https://github.com/maeehart/aiter.git"
+ARG AITER_COMMIT="c63defd4cad0d4a247c66072aa2156572a25eea8"
 # Add gfx950 to serve both MI325 and MI355 from one image, at the cost of
 # roughly double the kernel prebuild time.
 ARG GPU_ARCHS="gfx942"
@@ -31,8 +28,10 @@ ARG GPU_ARCHS="gfx942"
 # aiter cannot be imported here to verify the install: rocminfo needs /dev/kfd
 # and the build container has no GPU. Verification happens at runtime.
 RUN rm -rf /app/aiter \
-    && git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO} /app/aiter \
+    && git clone ${AITER_REPO} /app/aiter \
     && cd /app/aiter \
+    && git fetch origin ${AITER_COMMIT} \
+    && git checkout --detach ${AITER_COMMIT} \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt \
     && pip install pyyaml \
@@ -40,3 +39,7 @@ RUN rm -rf /app/aiter \
        python3 setup.py bdist_wheel --dist-dir=dist \
     && pip install --force-reinstall --no-deps dist/*.whl \
     && rm -rf /app/aiter/build /app/aiter/dist
+
+ENV VLLM_ROCM_USE_AITER=1 \
+    VLLM_ROCM_USE_AITER_MOE=1 \
+    VLLM_ROCM_USE_AITER_MLA=1
