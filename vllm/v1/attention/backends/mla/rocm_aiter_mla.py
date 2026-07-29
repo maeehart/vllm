@@ -671,10 +671,26 @@ def _expand_page_indices_kernel(
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _gluon_mla_decode_supported() -> bool:
+    """The small-head Gluon MLA kernel is CDNA4-only.
+
+    Its tiling needs about 160 KiB of LDS, which does not fit CDNA3's 64 KiB,
+    so there is no CDNA3 build of it to fall back on.
+    """
+    try:
+        from vllm.platforms.rocm import on_gfx950
+
+        return on_gfx950()
+    except ImportError:
+        return False
+
+
 class AiterMLAHelper:
     """
-    AITER MLA implementation requires num_heads >= 16. If num_heads < 16 and
-    16 % num_heads == 0, we can pad q to 16 heads; otherwise AITER has to fail.
+    AITER MLA implementation requires num_heads >= 16. Fewer heads are handled
+    either by the Gluon decode kernel, where available, or by padding q up to
+    16 heads and discarding the extra outputs.
     """
 
     _AITER_MIN_MLA_HEADS: Final = 16
@@ -683,9 +699,9 @@ class AiterMLAHelper:
     @staticmethod
     def check_num_heads_validity(num_heads: int):
         assert AiterMLAHelper.is_valid_num_heads(num_heads), (
-            "ROCM AITER MLA requires 1-15 heads for Gluon decode or a multiple "
-            f"of 16 heads for persistent decode, but got {num_heads}.\n"
-            f"Try adjusting tensor_parallel_size value."
+            "ROCM AITER MLA requires fewer than 16 heads, which are padded up "
+            "to 16, or a multiple of 16 heads for persistent decode, but got "
+            f"{num_heads}.\nTry adjusting tensor_parallel_size value."
         )
 
     @staticmethod
@@ -700,26 +716,39 @@ class AiterMLAHelper:
         return max(num_heads, AiterMLAHelper._AITER_MIN_MLA_HEADS)
 
     @staticmethod
+    def _pads_by_replication(num_heads: int) -> bool:
+        """Replication keeps every padded slot busy with a real head, so it is
+        preferred when 16 divides evenly. Otherwise the tail is zero filled."""
+        return AiterMLAHelper._AITER_MIN_MLA_HEADS % num_heads == 0
+
+    @staticmethod
     def get_mla_padded_q(num_heads: int, q: torch.Tensor) -> torch.Tensor:
-        return (
-            q
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else q.repeat_interleave(
-                AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, dim=1
-            )
-        )
+        min_heads = AiterMLAHelper._AITER_MIN_MLA_HEADS
+        if num_heads >= min_heads:
+            return q
+        if AiterMLAHelper._pads_by_replication(num_heads):
+            return q.repeat_interleave(min_heads // num_heads, dim=1)
+        # Zero rows still produce finite attention output, which is then
+        # dropped by get_mla_unpadded_o. Head count does not change the amount
+        # of latent KV read, so the extra rows cost no additional bandwidth.
+        return torch.nn.functional.pad(q, (0, 0, 0, min_heads - num_heads))
 
     @staticmethod
     def get_mla_unpadded_o(num_heads: int, o: torch.Tensor) -> torch.Tensor:
-        return (
-            o
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else o[:, :: AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, :]
-        )
+        min_heads = AiterMLAHelper._AITER_MIN_MLA_HEADS
+        if num_heads >= min_heads:
+            return o
+        if AiterMLAHelper._pads_by_replication(num_heads):
+            return o[:, :: min_heads // num_heads, :]
+        return o[:, :num_heads, :]
 
     @staticmethod
     def use_gluon_decode(num_heads: int, max_qo_len: int) -> bool:
-        return num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS and max_qo_len == 1
+        return (
+            num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
+            and max_qo_len == 1
+            and _gluon_mla_decode_supported()
+        )
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
