@@ -461,7 +461,7 @@ _MULTIMODAL_MODELS = {
     "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),
     "KimiK25ForConditionalGeneration": ("kimi_k25", "KimiK25ForConditionalGeneration"),
     "KimiK3ForConditionalGeneration": (
-        "kimi_k3",
+        "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
     ),
     "MoonshotKimiaForCausalLM": ("kimi_audio", "KimiAudioForConditionalGeneration"),
