@@ -636,8 +636,8 @@ def _expand_page_indices_kernel(
 
 class AiterMLAHelper:
     """
-    AITER MLA implementation requires num_heads >= 16. If num_heads < 16 and
-    16 % num_heads == 0, we can pad q to 16 heads; otherwise AITER has to fail.
+    AITER MLA requires at least 16 query heads. Smaller head counts are padded
+    to 16 before decode and sliced back to the original size afterwards.
     """
 
     _AITER_MIN_MLA_HEADS: Final = 16
@@ -646,18 +646,15 @@ class AiterMLAHelper:
     @staticmethod
     def check_num_heads_validity(num_heads: int):
         assert AiterMLAHelper.is_valid_num_heads(num_heads), (
-            f"Aiter MLA requires that num_heads be multiples or divisors of 16, "
-            f"but provided {num_heads} number of heads.\n"
-            f"Try adjusting tensor_parallel_size value."
+            "AITER MLA requires 1-15 heads, which are padded to 16, or a "
+            f"multiple of 16 heads, but got {num_heads}.\n"
+            "Try adjusting tensor_parallel_size."
         )
 
     @staticmethod
     def is_valid_num_heads(num_heads: int) -> bool:
-        return (
-            num_heads % AiterMLAHelper._AITER_MIN_MLA_HEADS == 0
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else AiterMLAHelper._AITER_MIN_MLA_HEADS % num_heads == 0
-        )
+        min_heads = AiterMLAHelper._AITER_MIN_MLA_HEADS
+        return 0 < num_heads < min_heads or num_heads % min_heads == 0
 
     @staticmethod
     def get_actual_mla_num_heads(num_heads: int) -> int:
@@ -665,21 +662,21 @@ class AiterMLAHelper:
 
     @staticmethod
     def get_mla_padded_q(num_heads: int, q: torch.Tensor) -> torch.Tensor:
-        return (
-            q
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else q.repeat_interleave(
-                AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, dim=1
-            )
-        )
+        min_heads = AiterMLAHelper._AITER_MIN_MLA_HEADS
+        if num_heads >= min_heads:
+            return q
+        if min_heads % num_heads == 0:
+            return q.repeat_interleave(min_heads // num_heads, dim=1)
+        return torch.nn.functional.pad(q, (0, 0, 0, min_heads - num_heads))
 
     @staticmethod
     def get_mla_unpadded_o(num_heads: int, o: torch.Tensor) -> torch.Tensor:
-        return (
-            o
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else o[:, :: AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, :]
-        )
+        min_heads = AiterMLAHelper._AITER_MIN_MLA_HEADS
+        if num_heads >= min_heads:
+            return o
+        if min_heads % num_heads == 0:
+            return o[:, :: min_heads // num_heads, :]
+        return o[:, :num_heads, :]
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
