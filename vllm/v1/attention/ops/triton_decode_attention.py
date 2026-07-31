@@ -505,7 +505,12 @@ def _decode_grouped_att_m_fwd(
 
     BLOCK = 32
     if is_hip_:
-        BLOCK = 16
+        # CDNA3: the decode grid is (batch, 1, num_kv_splits) — only ~64
+        # workgroups at the serving batch — so per-workgroup memory-level
+        # parallelism, not occupancy, sets the rate. BLOCK_N=32 with a
+        # 2-stage pipeline keeps twice the K tile in flight and still fits
+        # LDS (53 KB of 64 KB at BLOCK_DMODEL+BLOCK_DPE=576).
+        BLOCK = 32
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[-2]
@@ -523,8 +528,8 @@ def _decode_grouped_att_m_fwd(
     if is_hip_:
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+        extra_kargs = {"waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 2
     elif not is_hip_ and BLOCK_DMODEL >= 1024:
         # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16

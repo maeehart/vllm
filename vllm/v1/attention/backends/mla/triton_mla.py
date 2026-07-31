@@ -34,17 +34,69 @@ logger = init_logger(__name__)
 
 # num_kv_splits selection (shared by forward_mqa and the workspace reservation
 # so the two cannot drift). Both are hardware dependent.
-_MIN_WORK_PER_SPLIT = 512
+_MIN_WORK_PER_SPLIT = 64
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+# Splits are the only source of parallelism in the split-KV decode grid
+# (batch, ceil(heads / BLOCK_H), splits), and for MLA the head dim collapses to
+# 1, so stage 1 stays memory-latency bound until well past 512 tokens per split.
+# Stage 2 walks the splits in a *serial* loop per (batch, head), so its cost is
+# linear in the split count and independent of the sequence length. Measured on
+# gfx942 (304 CUs) the two curves cross at 32: below it stage 1 dominates and
+# more splits pay for themselves, above it stage 2's reduction grows faster than
+# stage 1 shrinks. Holds across batch 1-8 and sequence lengths 512-9216.
+_MAX_KV_SPLITS = 32
+_GFX942_LONG_CONTEXT_MAX_SPLITS = 128
+_GFX942_LONG_CONTEXT_WORK_PER_SPLIT = 512
+_GFX942_TARGET_PARALLEL_SPLITS = 256
 
 
-def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
-    # Power of 2 to avoid excessive kernel instantiations, capped by an SM-based
-    # maximum (occupancy multiplier allows multiple blocks per SM
-    # for latency hiding).
+def _compute_num_kv_splits(
+    max_seq_len: int,
+    sm_count: int,
+    batch_size: int = 1,
+    use_gfx942_kimi_policy: bool = False,
+) -> int:
+    if use_gfx942_kimi_policy:
+        seq_cap = triton.next_power_of_2(
+            max(1, max_seq_len // _GFX942_LONG_CONTEXT_WORK_PER_SPLIT)
+        )
+        seq_cap = min(
+            _GFX942_LONG_CONTEXT_MAX_SPLITS,
+            max(_MAX_KV_SPLITS, seq_cap),
+        )
+        batch_cap = _GFX942_TARGET_PARALLEL_SPLITS // triton.next_power_of_2(
+            max(1, batch_size)
+        )
+        batch_cap = min(
+            _GFX942_LONG_CONTEXT_MAX_SPLITS,
+            max(_MAX_KV_SPLITS, batch_cap),
+        )
+        return min(seq_cap, batch_cap, sm_count * _SPLIT_OCCUPANCY_MULTIPLIER)
+
+    # Power of 2 to avoid excessive kernel instantiations, capped by the stage-2
+    # reduction crossover and by an SM-based maximum (occupancy multiplier
+    # allows multiple blocks per SM for latency hiding).
     ideal_splits = triton.next_power_of_2(max(1, max_seq_len // _MIN_WORK_PER_SPLIT))
-    max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
+    max_splits = min(_MAX_KV_SPLITS, sm_count * _SPLIT_OCCUPANCY_MULTIPLIER)
     return min(ideal_splits, max_splits)
+
+
+def _is_gfx942_kimi_mla_shape(
+    num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_count: int,
+) -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_rocm()
+        and capability is not None
+        and capability.to_int() == 94
+        and sm_count == 304
+        and num_heads == 12
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+    )
 
 
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -82,9 +134,18 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
             B *= self.reorder_batch_threshold
         # DCP all-gathers the query heads before forward_mqa.
         q_num_heads = self.num_heads * self.dcp_world_size
+        sm_count = current_platform.num_compute_units()
+        use_gfx942_kimi_policy = _is_gfx942_kimi_mla_shape(
+            self.num_heads,
+            self.mla_dims.kv_lora_rank,
+            self.mla_dims.qk_rope_head_dim,
+            sm_count,
+        )
         max_splits = _compute_num_kv_splits(
             self.model_config.max_model_len,
-            current_platform.num_compute_units(),
+            sm_count,
+            B,
+            use_gfx942_kimi_policy,
         )
         lse_dim = self.mla_dims.kv_lora_rank + 1
         current_workspace_manager().get_simultaneous(
@@ -232,6 +293,12 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self.supports_quant_query_input = False
 
         self._sm_count = current_platform.num_compute_units()
+        self._use_gfx942_kimi_split_policy = _is_gfx942_kimi_mla_shape(
+            self.num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self._sm_count,
+        )
 
     def forward_mqa(
         self,
@@ -259,7 +326,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             num_kv_splits = 1
         else:
             num_kv_splits = _compute_num_kv_splits(
-                attn_metadata.max_seq_len, self._sm_count
+                attn_metadata.max_seq_len,
+                self._sm_count,
+                B,
+                self._use_gfx942_kimi_split_policy,
             )
 
         # NOTE: the +1 stores the LogSumExp (LSE) that the stage2 kernel uses to
