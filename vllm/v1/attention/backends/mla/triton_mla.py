@@ -34,16 +34,25 @@ logger = init_logger(__name__)
 
 # num_kv_splits selection (shared by forward_mqa and the workspace reservation
 # so the two cannot drift). Both are hardware dependent.
-_MIN_WORK_PER_SPLIT = 512
+_MIN_WORK_PER_SPLIT = 64
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+# Splits are the only source of parallelism in the split-KV decode grid
+# (batch, ceil(heads / BLOCK_H), splits), and for MLA the head dim collapses to
+# 1, so stage 1 stays memory-latency bound until well past 512 tokens per split.
+# Stage 2 walks the splits in a *serial* loop per (batch, head), so its cost is
+# linear in the split count and independent of the sequence length. Measured on
+# gfx942 (304 CUs) the two curves cross at 32: below it stage 1 dominates and
+# more splits pay for themselves, above it stage 2's reduction grows faster than
+# stage 1 shrinks. Holds across batch 1-8 and sequence lengths 512-9216.
+_MAX_KV_SPLITS = 32
 
 
 def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
-    # Power of 2 to avoid excessive kernel instantiations, capped by an SM-based
-    # maximum (occupancy multiplier allows multiple blocks per SM
-    # for latency hiding).
+    # Power of 2 to avoid excessive kernel instantiations, capped by the stage-2
+    # reduction crossover and by an SM-based maximum (occupancy multiplier
+    # allows multiple blocks per SM for latency hiding).
     ideal_splits = triton.next_power_of_2(max(1, max_seq_len // _MIN_WORK_PER_SPLIT))
-    max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
+    max_splits = min(_MAX_KV_SPLITS, sm_count * _SPLIT_OCCUPANCY_MULTIPLIER)
     return min(ideal_splits, max_splits)
 
 
@@ -225,11 +234,23 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     f"--kv-cache-dtype float16."
                 )
 
-        # For FP8 KV cache, we dequantize to BF16 on load inside the
-        # Triton kernel. Tell the common layer not to quantize queries
-        # to FP8 — we handle FP8 KV cache with BF16 queries (Mode 1).
+        # gfx942 can execute the compressed-cache QK/PV products directly as
+        # FP8 MFMA. Keep this narrowly shape-gated to the Kimi TP8 MLA layout;
+        # other FP8 MLA shapes retain the established BF16-query dequant path.
+        self._native_fp8_mla = (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and current_platform.is_rocm()
+            and getattr(
+                torch.cuda.get_device_properties(torch.cuda.current_device()),
+                "gcnArchName",
+                "",
+            ).startswith("gfx942")
+            and self.num_heads == 12
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+        )
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            self.supports_quant_query_input = False
+            self.supports_quant_query_input = self._native_fp8_mla
 
         self._sm_count = current_platform.num_compute_units()
 
@@ -249,10 +270,11 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
         q_num_heads = q.shape[1]
+        output_dtype = torch.bfloat16 if self._native_fp8_mla else q.dtype
         o = torch.zeros(
-            B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B, q_num_heads, self.kv_lora_rank, dtype=output_dtype, device=q.device
         )
-        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
+        lse = torch.zeros(B, q_num_heads, dtype=output_dtype, device=q.device)
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
         if envs.VLLM_BATCH_INVARIANT:
@@ -311,6 +333,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             PAGE_SIZE,
             k_scale=layer._k_scale,
             v_scale=layer._k_scale,
+            q_scale=layer._q_scale,
             is_mla=True,
         )
 
