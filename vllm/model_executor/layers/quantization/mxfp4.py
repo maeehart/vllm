@@ -896,39 +896,72 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fp4_dtype = torch.float4_e2m1fn_x2
         e8m0_dtype = torch.float8_e8m0fnu
 
+        # The dequant chain cannot run in place: mxfp4_to_f32 does a
+        # repeat_interleave to split the packed nibbles, then an f32 LUT
+        # gather, so the working tensor grows 8x over the packed weight
+        # before per_1x32_i4_quant shrinks it again. Materializing that for
+        # a whole expert tensor peaks well above 20 GiB per rank, which does
+        # not fit once the weights are resident. Convert a slice of experts
+        # at a time and free each slice before the next, so the transient is
+        # bounded by _CONVERT_CHUNK / num_experts of the full tensor.
+        _CONVERT_CHUNK = 8
+
         def convert(
             weight: torch.nn.Parameter,
             scale: torch.nn.Parameter,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            weight_f32 = fp4_utils.mxfp4_to_f32(weight.data.view(fp4_dtype))
-            scale_f32 = fp4_utils.e8m0_to_f32(scale.data.view(e8m0_dtype))
-            num_experts, output_size, input_size = weight_f32.shape
-            weight_bf16 = (
-                (
-                    weight_f32.view(num_experts, output_size, input_size // 32, 32)
-                    * scale_f32.view(num_experts, output_size, input_size // 32, 1)
-                )
-                .view(num_experts, output_size, input_size)
-                .to(torch.bfloat16)
-            )
-            del weight_f32, scale_f32
+            w_all = weight.data.view(fp4_dtype)
+            s_all = scale.data.view(e8m0_dtype)
+            num_experts = w_all.shape[0]
 
-            weight_int4, weight_scale = per_1x32_i4_quant(weight_bf16)
-            del weight_bf16
-            weight_int4 = weight_int4.view(aiter_dtypes.i4x2).view(
-                num_experts, output_size, input_size
-            )
-            weight_packed = pack_int8_to_packed_int4(
-                shuffle_weight(weight_int4.view(aiter_dtypes.i8), (16, 16))
-            )
-            weight_packed = weight_packed.view(
-                num_experts, output_size, input_size // 2
-            ).view(aiter_dtypes.i4x2)
-            weight_scale = (
-                shuffle_scale_for_int4(weight_scale, group_size=32)
-                .view(-1)
-                .contiguous()
-            )
+            packed_chunks: list[torch.Tensor] = []
+            scale_chunks: list[torch.Tensor] = []
+            for lo in range(0, num_experts, _CONVERT_CHUNK):
+                hi = min(lo + _CONVERT_CHUNK, num_experts)
+                weight_f32 = fp4_utils.mxfp4_to_f32(w_all[lo:hi])
+                scale_f32 = fp4_utils.e8m0_to_f32(s_all[lo:hi])
+                chunk_experts, output_size, input_size = weight_f32.shape
+                weight_bf16 = (
+                    (
+                        weight_f32.view(
+                            chunk_experts, output_size, input_size // 32, 32
+                        )
+                        * scale_f32.view(
+                            chunk_experts, output_size, input_size // 32, 1
+                        )
+                    )
+                    .view(chunk_experts, output_size, input_size)
+                    .to(torch.bfloat16)
+                )
+                del weight_f32, scale_f32
+
+                weight_int4, weight_scale = per_1x32_i4_quant(weight_bf16)
+                del weight_bf16
+                weight_int4 = weight_int4.view(aiter_dtypes.i4x2).view(
+                    chunk_experts, output_size, input_size
+                )
+                weight_packed = pack_int8_to_packed_int4(
+                    shuffle_weight(weight_int4.view(aiter_dtypes.i8), (16, 16))
+                )
+                del weight_int4
+                packed_chunks.append(
+                    weight_packed.view(
+                        chunk_experts, output_size, input_size // 2
+                    ).view(aiter_dtypes.i4x2)
+                )
+                scale_chunks.append(
+                    shuffle_scale_for_int4(weight_scale, group_size=32)
+                    .view(-1)
+                    .contiguous()
+                )
+                del weight_packed, weight_scale
+                torch.cuda.empty_cache()
+
+            weight_packed = torch.cat(packed_chunks, dim=0)
+            del packed_chunks
+            weight_scale = torch.cat(scale_chunks, dim=0)
+            del scale_chunks
+            torch.cuda.empty_cache()
             return weight_packed, weight_scale
 
         w13, w13_scale = convert(layer.w13_weight, layer.w13_weight_scale)
