@@ -61,6 +61,9 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.layers.fused_moe.runner.latent_moe_runner import (
+    LatentMoERunner,
+)
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -280,6 +283,7 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
+            runner_cls=LatentMoERunner if self.use_latent_moe else None,
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -299,7 +303,9 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=routed_hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=hidden_states if self.use_latent_moe else None,
         )
         return final_hidden_states.view(num_tokens, hidden_size)
 
