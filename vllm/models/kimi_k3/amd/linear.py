@@ -65,6 +65,9 @@ from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -254,6 +257,11 @@ class KimiMoE(nn.Module):
             self.routed_output_transform = KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
             )
+            # Aux HIP stream to overlap the router gate with the routed
+            # down projection on decode-sized batches (gated by
+            # VLLM_ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
+            self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
+            self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -294,12 +302,37 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+    def _maybe_overlap_router_and_down_proj(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        def _router(hs: torch.Tensor) -> torch.Tensor:
+            logits, _ = self.gate(hs)
+            return logits
+
+        down_proj = self.routed_expert_down_proj
+        if down_proj is None:
+            return hidden_states, _router(hidden_states)
+
+        num_tokens = hidden_states.shape[0]
+        (router_logits, _), (routed_hidden_states, _) = maybe_execute_in_parallel(
+            lambda: (_router(hidden_states), None),
+            lambda: down_proj(hidden_states),
+            self._down_proj_events[0],
+            self._down_proj_events[1],
+            self._down_proj_stream
+            if num_tokens <= envs.VLLM_ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+            else None,
+        )
+        return routed_hidden_states, router_logits
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
+        routed_hidden_states, router_logits = (
+            self._maybe_overlap_router_and_down_proj(hidden_states)
+        )
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=routed_hidden_states, router_logits=router_logits
         )
         return final_hidden_states.view(num_tokens, hidden_size)
 
