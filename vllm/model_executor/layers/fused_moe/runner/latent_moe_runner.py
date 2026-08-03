@@ -12,11 +12,18 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     flashinfer_trtllm_fused_allreduce_norm,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import aux_stream, current_stream
 
 from .moe_runner import MoERunner, _unpack
 
 logger = init_logger(__name__)
+
+try:
+    from vllm._aiter_ops import rocm_aiter_ops as _aiter_ops
+    _aiter_fused_ar_rmsnorm = _aiter_ops.get_fused_allreduce_rmsnorm_op()
+except Exception:
+    _aiter_fused_ar_rmsnorm = None
 
 
 class LatentMoERunner(MoERunner):
@@ -222,8 +229,14 @@ class LatentMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         norm: RMSNorm,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """All-reduce + add residual + (standard) RMSNorm, fused via flashinfer."""
+    ) -> torch.Tensor:
+        """All-reduce + RMSNorm, fused when a fast path is available.
+
+        Priority:
+          1. flashinfer fused AR+RMSNorm (NVIDIA, NVLink/NVSwitch required)
+          2. AITER fused AR+RMSNorm (AMD ROCm, xGMI/Infinity Fabric)
+          3. Unfused fallback: tensor_model_parallel_all_reduce + norm()
+        """
         if self.moe_config.tp_size == 1:
             return norm(hidden_states)
 
@@ -250,6 +263,22 @@ class LatentMoERunner(MoERunner):
                     norm_out=norm_out,
                 )
                 return norm_out
+
+        if (
+            _aiter_fused_ar_rmsnorm is not None
+            and current_platform.is_rocm()
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        ):
+            result = _aiter_fused_ar_rmsnorm(
+                input_=hidden_states,
+                residual=self._get_zero_residual(hidden_states),
+                weight=norm.weight.to(hidden_states.dtype),
+                epsilon=norm.variance_epsilon,
+            )
+            return result[0]
 
         reduced = tensor_model_parallel_all_reduce(hidden_states)
         return norm(reduced)
