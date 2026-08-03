@@ -12,11 +12,19 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx942, on_gfx950
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(),
-    reason="Fused KDA decode is only built for ROCm here",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not current_platform.is_rocm(),
+        reason="Fused KDA decode is only built for ROCm",
+    ),
+    pytest.mark.skipif(
+        current_platform.is_rocm() and not (on_gfx950() or on_gfx942()),
+        reason="Fused KDA decode kernel not supported on this ROCm arch "
+               "(requires gfx950/MI355X or gfx942/MI325X)",
+    ),
+]
 
 # Kimi-K3 KDA: 96 heads x 128, conv width 4, gate_lower_bound -5.0.
 HEAD_DIM = 128
