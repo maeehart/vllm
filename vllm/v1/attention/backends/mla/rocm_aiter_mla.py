@@ -1159,6 +1159,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         if (
             self.num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
             and int(decode.max_qo_len) > 1
+            and _gluon_mla_decode_supported()
         ):
             qlen = int(decode.max_qo_len)
             if type(q) is tuple:
