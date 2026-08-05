@@ -320,20 +320,38 @@ class KimiMoE(nn.Module):
             self._down_proj_events[0],
             self._down_proj_events[1],
             self._down_proj_stream
-            if num_tokens <= envs.VLLM_ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
-            else None,
+            # if num_tokens <= envs.VLLM_ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+            # else None,
         )
         return routed_hidden_states, router_logits
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        # # no overlap
+        # router_logits, _ = self.gate(hidden_states)
+        # final_hidden_states = self.experts(
+        #     hidden_states=hidden_states, router_logits=router_logits
+        # )
+
+        # overlap
         routed_hidden_states, router_logits = (
             self._maybe_overlap_router_and_down_proj(hidden_states)
         )
-        final_hidden_states = self.experts(
-            hidden_states=routed_hidden_states, router_logits=router_logits
-        )
+        if self.routed_expert_down_proj is not None:
+            # The routed input transform was already applied above, so pass the
+            # original hidden states as shared_experts_input to tell the runner
+            # to skip re-applying it.
+            final_hidden_states = self.experts(
+                hidden_states=routed_hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=hidden_states,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=routed_hidden_states, router_logits=router_logits
+            )
+        
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
