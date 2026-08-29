@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import csv
+import functools
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -84,12 +87,83 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+_GLM52_CPX_STAGE1 = "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2_bnt0"
+_GLM52_CPX_STAGE2 = "flydsl_moe2_afp4_wfp4_bf16_t32x256x128_atomic_bnt2"
+_GLM52_CPX_DECODE_TIERS = frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256})
+
 __all__ = [
     "QuarkMoEMethod",
     "QuarkW8A8Fp8MoEMethod",
     "QuarkOCP_MX_MoEMethod",
     "QuarkNvfp4MoEMethod",
 ]
+
+
+@functools.lru_cache(maxsize=1)
+def _verify_glm52_cpx_aiter_runtime(backend: Mxfp4MoeBackend) -> None:
+    if not envs.VLLM_ROCM_GLM52_CPX_TP16:
+        return
+    if backend is not Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        raise RuntimeError(
+            "VLLM_ROCM_GLM52_CPX_TP16=1 requires the "
+            "AITER_MXFP4_BF16 MoE backend, but selected "
+            f"{backend.value}."
+        )
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch = getattr(
+        properties,
+        "gcnArchName",
+        getattr(properties, "gcn_arch_name", ""),
+    ).split(":", 1)[0]
+    cu_count = properties.multi_processor_count
+    if arch != "gfx950" or cu_count != 32:
+        raise RuntimeError(
+            "VLLM_ROCM_GLM52_CPX_TP16=1 requires one gfx950 CPX partition "
+            f"per rank (32 CUs), but detected arch={arch!r}, cu_count={cu_count}."
+        )
+
+    try:
+        from aiter.jit.core import AITER_CONFIGS
+        from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "VLLM_ROCM_GLM52_CPX_TP16=1 requires an AITER build with "
+            "FlyDSL tuned-config support."
+        ) from error
+
+    config_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    with open(config_file, newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    matching_rows = [
+        row
+        for row in rows
+        if row.get("gfx") == "gfx950"
+        and row.get("cu_num") == "32"
+        and row.get("model_dim") == "6144"
+        and row.get("inter_dim") == "128"
+        and row.get("expert") == "257"
+        and row.get("topk") == "9"
+        and row.get("kernelName1") == _GLM52_CPX_STAGE1
+        and row.get("kernelName2") == _GLM52_CPX_STAGE2
+    ]
+    configured_tiers = {int(row["token"]) for row in matching_rows}
+    missing_tiers = sorted(_GLM52_CPX_DECODE_TIERS - configured_tiers)
+    if missing_tiers:
+        raise RuntimeError(
+            "VLLM_ROCM_GLM52_CPX_TP16=1 could not find the validated "
+            f"GLM-5.2 CU32 FlyDSL rows in {config_file!r}; "
+            f"missing decode tiers: {missing_tiers}."
+        )
+
+    for kernel_name in (_GLM52_CPX_STAGE1, _GLM52_CPX_STAGE2):
+        if get_flydsl_kernel_params(kernel_name) is None:
+            raise RuntimeError(
+                "VLLM_ROCM_GLM52_CPX_TP16=1 requires FlyDSL kernel "
+                f"{kernel_name!r}, but the installed AITER registry lacks it."
+            )
+
+    logger.info_once("Validated GLM-5.2 MXFP4 CU32 FlyDSL rows and kernel registry.")
 
 
 class QuarkMoEMethod(FusedMoEMethodBase):
@@ -1132,6 +1206,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             self.mxfp4_backend = Mxfp4MoeBackend.EMULATION
 
         self.experts_cls = backend_to_kernel_cls(self.mxfp4_backend)[0]
+        _verify_glm52_cpx_aiter_runtime(self.mxfp4_backend)
 
         logger.info_once(
             f"Using {self.mxfp4_backend.value} backend for {self.ocp_mx_scheme}"

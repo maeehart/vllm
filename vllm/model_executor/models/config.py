@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -25,6 +26,79 @@ class VerifyAndUpdateConfig:
         return
 
 
+def _verify_glm52_cpx_tp16_config(vllm_config: "VllmConfig") -> None:
+    if not envs.VLLM_ROCM_GLM52_CPX_TP16:
+        return
+
+    from vllm.platforms import current_platform
+
+    hf_config = vllm_config.model_config.hf_config
+    parallel_config = vllm_config.parallel_config
+    quantization_config = getattr(hf_config, "quantization_config", {})
+    if isinstance(quantization_config, dict):
+        quant_method = quantization_config.get("quant_method")
+    else:
+        quant_method = getattr(quantization_config, "quant_method", None)
+
+    expected = {
+        "model_type": "glm_moe_dsa",
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "n_shared_experts": 1,
+        "quant_method": "quark",
+        "tensor_parallel_size": 16,
+        "intermediate_size_per_partition": 128,
+        "enable_expert_parallel": False,
+        "VLLM_ROCM_USE_AITER": True,
+        "VLLM_ROCM_USE_AITER_MOE": True,
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": True,
+        "is_rocm": True,
+    }
+    moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", None)
+    tp_size = parallel_config.tensor_parallel_size
+    actual = {
+        "model_type": getattr(hf_config, "model_type", None),
+        "hidden_size": getattr(hf_config, "hidden_size", None),
+        "moe_intermediate_size": moe_intermediate_size,
+        "n_routed_experts": getattr(hf_config, "n_routed_experts", None),
+        "num_experts_per_tok": getattr(hf_config, "num_experts_per_tok", None),
+        "n_shared_experts": getattr(hf_config, "n_shared_experts", None),
+        "quant_method": quant_method,
+        "tensor_parallel_size": tp_size,
+        "intermediate_size_per_partition": (
+            moe_intermediate_size // tp_size
+            if isinstance(moe_intermediate_size, int)
+            and moe_intermediate_size % tp_size == 0
+            else None
+        ),
+        "enable_expert_parallel": parallel_config.enable_expert_parallel,
+        "VLLM_ROCM_USE_AITER": envs.VLLM_ROCM_USE_AITER,
+        "VLLM_ROCM_USE_AITER_MOE": envs.VLLM_ROCM_USE_AITER_MOE,
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": (
+            envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        ),
+        "is_rocm": current_platform.is_rocm(),
+    }
+    mismatches = {
+        key: {"expected": expected[key], "actual": value}
+        for key, value in actual.items()
+        if value != expected[key]
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}={item['actual']!r} (expected {item['expected']!r})"
+            for key, item in mismatches.items()
+        )
+        raise ValueError(
+            "VLLM_ROCM_GLM52_CPX_TP16=1 requires the validated "
+            f"GLM-5.2 MXFP4 AITER TP16 configuration: {details}"
+        )
+
+    logger.info("Validated GLM-5.2 MXFP4 CPX/TP16 model and AITER configuration.")
+
+
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -43,6 +117,7 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
 class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        _verify_glm52_cpx_tp16_config(vllm_config)
         # For Glm-Moe-DSA, qrep + a2a is better than the default all-gather + ag-rs
         # in most cases.
         vllm_config.parallel_config.set_dcp_defaults(
