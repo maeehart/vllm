@@ -103,10 +103,10 @@ __all__ = [
 def _verify_glm52_cpx_aiter_runtime(backend: Mxfp4MoeBackend) -> None:
     if not envs.VLLM_ROCM_GLM52_CPX_TP16:
         return
-    if backend is not Mxfp4MoeBackend.AITER_MXFP4_BF16:
+    if backend is not Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
         raise RuntimeError(
             "VLLM_ROCM_GLM52_CPX_TP16=1 requires the "
-            "AITER_MXFP4_BF16 MoE backend, but selected "
+            "AITER_MXFP4_MXFP4 MoE backend, but selected "
             f"{backend.value}."
         )
 
