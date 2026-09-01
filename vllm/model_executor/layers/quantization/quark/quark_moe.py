@@ -89,6 +89,8 @@ logger = init_logger(__name__)
 
 _GLM52_CPX_STAGE1 = "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2_bnt0"
 _GLM52_CPX_STAGE2 = "flydsl_moe2_afp4_wfp4_bf16_t32x256x128_atomic_bnt2"
+_GLM52_CPX_TP64_STAGE1 = "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w2_bnt0_fp4"
+_GLM52_CPX_TP64_STAGE2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x256x128_atomic_sbm32"
 _GLM52_CPX_DECODE_TIERS = frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256})
 
 __all__ = [
@@ -101,12 +103,22 @@ __all__ = [
 
 @functools.lru_cache(maxsize=1)
 def _verify_glm52_cpx_aiter_runtime(backend: Mxfp4MoeBackend) -> None:
-    if not envs.VLLM_ROCM_GLM52_CPX_TP16:
+    tp_size = (
+        16
+        if envs.VLLM_ROCM_GLM52_CPX_TP16
+        else 32
+        if envs.VLLM_ROCM_GLM52_CPX_TP32
+        else 64
+        if envs.VLLM_ROCM_GLM52_CPX_TP64
+        else None
+    )
+    if tp_size is None:
         return
-    if backend is not Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+    expected_backend = Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+    if backend is not expected_backend:
         raise RuntimeError(
-            "VLLM_ROCM_GLM52_CPX_TP16=1 requires the "
-            "AITER_MXFP4_MXFP4 MoE backend, but selected "
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 requires the "
+            f"{expected_backend.value} MoE backend, but selected "
             f"{backend.value}."
         )
 
@@ -119,49 +131,62 @@ def _verify_glm52_cpx_aiter_runtime(backend: Mxfp4MoeBackend) -> None:
     cu_count = properties.multi_processor_count
     if arch != "gfx950" or cu_count != 32:
         raise RuntimeError(
-            "VLLM_ROCM_GLM52_CPX_TP16=1 requires one gfx950 CPX partition "
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 requires one gfx950 CPX partition "
             f"per rank (32 CUs), but detected arch={arch!r}, cu_count={cu_count}."
         )
 
     try:
         from aiter.jit.core import AITER_CONFIGS
         from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
     except (ImportError, AttributeError) as error:
         raise RuntimeError(
-            "VLLM_ROCM_GLM52_CPX_TP16=1 requires an AITER build with "
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 requires an AITER build with "
             "FlyDSL tuned-config support."
         ) from error
 
     config_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     with open(config_file, newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
+    expected_inter_dim = 32 if tp_size == 64 else 128
+    expected_stage1 = _GLM52_CPX_TP64_STAGE1 if tp_size == 64 else _GLM52_CPX_STAGE1
+    expected_stage2 = _GLM52_CPX_TP64_STAGE2 if tp_size == 64 else _GLM52_CPX_STAGE2
     matching_rows = [
         row
         for row in rows
         if row.get("gfx") == "gfx950"
         and row.get("cu_num") == "32"
         and row.get("model_dim") == "6144"
-        and row.get("inter_dim") == "128"
+        and row.get("inter_dim") == str(expected_inter_dim)
         and row.get("expert") == "257"
         and row.get("topk") == "9"
-        and row.get("kernelName1") == _GLM52_CPX_STAGE1
-        and row.get("kernelName2") == _GLM52_CPX_STAGE2
+        and row.get("kernelName1") == expected_stage1
+        and row.get("kernelName2") == expected_stage2
     ]
     configured_tiers = {int(row["token"]) for row in matching_rows}
     missing_tiers = sorted(_GLM52_CPX_DECODE_TIERS - configured_tiers)
     if missing_tiers:
         raise RuntimeError(
-            "VLLM_ROCM_GLM52_CPX_TP16=1 could not find the validated "
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 could not find the validated "
             f"GLM-5.2 CU32 FlyDSL rows in {config_file!r}; "
             f"missing decode tiers: {missing_tiers}."
         )
 
-    for kernel_name in (_GLM52_CPX_STAGE1, _GLM52_CPX_STAGE2):
-        if get_flydsl_kernel_params(kernel_name) is None:
-            raise RuntimeError(
-                "VLLM_ROCM_GLM52_CPX_TP16=1 requires FlyDSL kernel "
-                f"{kernel_name!r}, but the installed AITER registry lacks it."
-            )
+    if get_flydsl_kernel_params(expected_stage1) is None:
+        raise RuntimeError(
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 requires FlyDSL kernel "
+            f"{expected_stage1!r}, but the installed AITER registry lacks it."
+        )
+    stage2_params = (
+        parse_flydsl_v2_gemm2_kernel(expected_stage2)
+        if tp_size == 64
+        else get_flydsl_kernel_params(expected_stage2)
+    )
+    if stage2_params is None:
+        raise RuntimeError(
+            f"VLLM_ROCM_GLM52_CPX_TP{tp_size}=1 requires FlyDSL kernel "
+            f"{expected_stage2!r}, but the installed AITER registry lacks it."
+        )
 
     logger.info_once("Validated GLM-5.2 MXFP4 CU32 FlyDSL rows and kernel registry.")
 

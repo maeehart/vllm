@@ -9,6 +9,7 @@ These tests run on real hardware — no mocks. Skipped on non-GFX950 platforms.
 import pytest
 import torch
 
+from vllm.envs import disable_envs_cache
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
+    convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -95,6 +97,82 @@ def test_w4a4_dispatches_to_aiter(mxfp4_oracle_config, enable_rocm_aiter):
     )
     assert backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
     assert experts_cls is not None
+
+
+@pytest.mark.skipif(not ROCM_GFX950, reason="Requires GFX950 (mi355x)")
+def test_glm52_cpx_tp64_keeps_aiter_a4w4(
+    mxfp4_oracle_config,
+    enable_rocm_aiter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_ROCM_GLM52_CPX_TP64", "1")
+    disable_envs_cache()
+    try:
+        backend, experts_cls = select_mxfp4_moe_backend(
+            _make_w4a4_moe_config(), activation_key=kMxfp4Dynamic
+        )
+    finally:
+        disable_envs_cache()
+    assert backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+    assert experts_cls is not None
+
+
+@pytest.mark.skipif(not ROCM_GFX950, reason="Requires GFX950 (mi355x)")
+def test_glm52_cpx_tp64_keeps_compact_w2(
+    enable_rocm_aiter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    experts = 257
+    hidden_size = 6144
+    intermediate_size = 32
+    monkeypatch.setenv("VLLM_ROCM_GLM52_CPX_TP64", "1")
+    disable_envs_cache()
+    try:
+        w13 = torch.randint(
+            0,
+            256,
+            (experts, intermediate_size * 2, hidden_size // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2 = torch.randint(
+            0,
+            256,
+            (experts, hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        original_w2 = w2.clone()
+        w13_scale = torch.full(
+            (experts, intermediate_size * 2, hidden_size // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2_scale = torch.full(
+            (experts, hidden_size, intermediate_size // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        converted = convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+            torch.nn.Module(),
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+        )
+    finally:
+        disable_envs_cache()
+
+    converted_w13, converted_w2, _, converted_w2_scale, _, _ = converted
+    assert converted_w13.is_shuffled
+    assert converted_w2.compact_k32
+    assert converted_w2.shape == (experts, hidden_size, intermediate_size // 2)
+    assert torch.equal(converted_w2.view(torch.uint8), original_w2)
+    assert converted_w2_scale.shape == (experts, hidden_size, 8)
+    assert set(converted_w2_scale.view(torch.uint8).unique().tolist()) == {0, 0x7F}
 
 
 @pytest.mark.skipif(not ROCM_GFX950, reason="Requires GFX950 (mi355x)")

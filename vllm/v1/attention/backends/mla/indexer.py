@@ -64,6 +64,38 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
 
 
 @triton.jit
+def _replicated_dcp_slot_mapping_kernel(
+    query_start_loc_ptr,
+    positions_ptr,
+    block_table_ptr,
+    output_ptr,
+    block_table_stride,
+    virtual_block_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start = tl.load(query_start_loc_ptr + req_idx)
+    end = tl.load(query_start_loc_ptr + req_idx + 1)
+    row_offset = req_idx * block_table_stride
+    for offset in range(start, end, BLOCK_SIZE):
+        token_offsets = offset + tl.arange(0, BLOCK_SIZE)
+        mask = token_offsets < end
+        positions = tl.load(positions_ptr + token_offsets, mask=mask, other=0)
+        block_indices = positions // virtual_block_size
+        block_numbers = tl.load(
+            block_table_ptr + row_offset + block_indices,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        slot_offsets = positions % virtual_block_size
+        tl.store(
+            output_ptr + token_offsets,
+            block_numbers * virtual_block_size + slot_offsets,
+            mask=mask,
+        )
+
+
+@triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
     decode_seq_lens_ptr,
@@ -532,7 +564,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        configured_dcp_world_size = parallel_config.decode_context_parallel_size
+        state_content_bytes = getattr(self.kv_cache_spec, "state_content_bytes", None)
+        dtype_bytes = torch.empty((), dtype=self.kv_cache_spec.dtype).element_size()
+        self.replicated_dcp_cache = (
+            configured_dcp_world_size > 1
+            and state_content_bytes
+            == self.kv_cache_spec.head_size * configured_dcp_world_size * dtype_bytes
+        )
+        self.cache_dcp_world_size = configured_dcp_world_size
+        self.dcp_world_size = (
+            1 if self.replicated_dcp_cache else configured_dcp_world_size
+        )
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
@@ -605,6 +648,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             ),
             dtype=torch.int32,
             device=self.device,
+        )
+        self.replicated_slot_mapping_buffer = (
+            torch.empty(
+                scheduler_config.max_num_batched_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if self.replicated_dcp_cache
+            else None
         )
         self.expanded_block_table_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens, block_table_width),
@@ -848,6 +900,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
+        if self.replicated_dcp_cache:
+            assert common_attn_metadata.positions is not None
+            assert self.replicated_slot_mapping_buffer is not None
+            virtual_block_size = (
+                self.kv_cache_spec.block_size * self.cache_dcp_world_size
+            )
+            _replicated_dcp_slot_mapping_kernel[(num_reqs,)](
+                query_start_loc,
+                common_attn_metadata.positions,
+                block_table,
+                self.replicated_slot_mapping_buffer,
+                block_table.stride(0),
+                virtual_block_size,
+                BLOCK_SIZE=1024,
+            )
+            slot_mapping = self.replicated_slot_mapping_buffer[:num_tokens]
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(

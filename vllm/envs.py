@@ -137,6 +137,10 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_GLM52_CPX_TP16: bool = False
+    VLLM_ROCM_GLM52_CPX_TP32: bool = False
+    VLLM_ROCM_GLM52_CPX_TP64: bool = False
+    VLLM_ROCM_GLM52_CPX_EXACT_ALLREDUCE: bool = False
+    VLLM_ROCM_GLM52_DCP_REPLICATE_INDEXER_CACHE: bool = False
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
@@ -1258,6 +1262,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fail-closed guard for the tuned GLM-5.2 MXFP4 CPX/TP16 path.
     "VLLM_ROCM_GLM52_CPX_TP16": lambda: (
         os.getenv("VLLM_ROCM_GLM52_CPX_TP16", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_GLM52_CPX_TP32": lambda: (
+        os.getenv("VLLM_ROCM_GLM52_CPX_TP32", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_GLM52_CPX_TP64": lambda: (
+        os.getenv("VLLM_ROCM_GLM52_CPX_TP64", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_GLM52_CPX_EXACT_ALLREDUCE": lambda: (
+        os.getenv("VLLM_ROCM_GLM52_CPX_EXACT_ALLREDUCE", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_ROCM_GLM52_DCP_REPLICATE_INDEXER_CACHE": lambda: (
+        os.getenv(
+            "VLLM_ROCM_GLM52_DCP_REPLICATE_INDEXER_CACHE",
+            "False",
+        ).lower()
+        in ("true", "1")
     ),
     # Route K3 SiTU MXFP4 MoE through the a8w4 (fp8 activation) gate/up-
     # interleaved flydsl kernels instead of the default a16w4 separated path.

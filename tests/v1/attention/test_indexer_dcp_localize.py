@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
@@ -268,6 +269,86 @@ def test_get_dcp_local_seq_lens_matches_naive(world: int, interleave: int):
             dtype=torch.int32,
         )
         torch.testing.assert_close(actual, expected)
+
+
+def test_replicated_indexer_cache_reuses_dcp_virtual_blocks():
+    cache = object.__new__(DeepseekV32IndexerCache)
+    torch.nn.Module.__init__(cache)
+    cache.head_dim = 132
+    cache.dtype = torch.uint8
+    cache.dcp_world_size = 32
+    cache.replicate_dcp_cache = True
+    cache.cache_config = type("CacheConfig", (), {"block_size": 64})()
+
+    raw = torch.empty((2, 1, 64, 132 * 32), dtype=torch.uint8)
+    cache.bind_kv_cache(raw)
+    spec = cache.get_kv_cache_spec(
+        type(
+            "VllmConfig",
+            (),
+            {
+                "parallel_config": type(
+                    "ParallelConfig",
+                    (),
+                    {"decode_context_parallel_size": 32},
+                )()
+            },
+        )()
+    )
+
+    assert cache.kv_cache.shape == (2, 64 * 32, 132)
+    assert cache.kv_cache.data_ptr() == raw.data_ptr()
+    assert spec.state_content_bytes == 132 * 32
+    assert spec.page_size_bytes == 64 * 132 * 32
+    assert (
+        spec.max_num_blocks_per_req(
+            type(
+                "VllmConfig",
+                (),
+                {
+                    "parallel_config": type(
+                        "ParallelConfig",
+                        (),
+                        {"decode_context_parallel_size": 32},
+                    )()
+                },
+            )(),
+            258048,
+        )
+        == 126
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="This test requires ROCm")
+def test_replicated_indexer_slot_mapping_covers_full_virtual_block():
+    from vllm.v1.attention.backends.mla.indexer import (
+        _replicated_dcp_slot_mapping_kernel,
+    )
+
+    device = torch.device("cuda")
+    query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 31, 2047, 2048, 2051], device=device)
+    block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32, device=device)
+    output = torch.empty(5, dtype=torch.int64, device=device)
+
+    _replicated_dcp_slot_mapping_kernel[(2,)](
+        query_start_loc,
+        positions,
+        block_table,
+        output,
+        block_table.stride(0),
+        64 * 32,
+        BLOCK_SIZE=1024,
+    )
+    torch.accelerator.synchronize()
+
+    assert output.cpu().tolist() == [
+        10 * 2048,
+        10 * 2048 + 31,
+        10 * 2048 + 2047,
+        21 * 2048,
+        21 * 2048 + 3,
+    ]
 
 
 def test_get_dcp_local_seq_lens_can_localize_per_token_bounds():
@@ -564,6 +645,95 @@ def test_cutedsl_dcp_candidate_pack_and_select_matches_reference(
 
     for row in range(rows):
         assert set(actual[row].cpu().tolist()) == set(expected[row].cpu().tolist())
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="This test requires ROCm")
+def test_rocm_dcp_candidate_merge_matches_global_reference(monkeypatch):
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as rocm_sparse
+
+    torch.manual_seed(19)
+    device = torch.device("cuda")
+    rows = 3
+    local_width = 16
+    topk = 8
+    world = 2
+
+    local_logits = [
+        torch.randn((rows, local_width), device=device, dtype=torch.float32)
+        for _ in range(world)
+    ]
+    local_indices = [
+        logits.topk(topk, dim=1).indices.to(torch.int32) for logits in local_logits
+    ]
+    packed = []
+    for rank in range(world):
+        scores = local_logits[rank].gather(1, local_indices[rank].long())
+        global_ids = local_indices[rank] * world + rank
+        packed.append(torch.stack((scores, global_ids.to(torch.float32)), dim=-1))
+    gathered = torch.cat(packed, dim=1).contiguous()
+    expected = _ref_stable_topk_from_candidates_fp64(
+        gathered[..., 0],
+        gathered[..., 1].to(torch.int32),
+        topk,
+    )
+
+    monkeypatch.setattr(
+        rocm_sparse,
+        "get_dcp_group",
+        lambda: _FakeDCPGroup(gathered),
+    )
+    monkeypatch.setattr(rocm_sparse, "_get_aiter_topk_ops", lambda: None)
+
+    for rank in range(world):
+        actual = local_indices[rank].clone()
+        rocm_sparse._merge_dcp_topk_global_rocm(
+            local_logits[rank],
+            actual,
+            topk,
+            rank,
+            world,
+            1,
+        )
+        for row in range(rows):
+            assert set(actual[row].cpu().tolist()) == set(expected[row].cpu().tolist())
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="This test requires ROCm")
+def test_rocm_aiter_sparse_indices_pack_local_physical_slots():
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+        prepare_dcp_sparse_indices,
+    )
+
+    device = torch.device("cuda")
+    block_size = 4
+    topk = 128
+    token_indices = torch.full((2, topk), -1, dtype=torch.int32, device=device)
+    token_indices[0, :8] = torch.arange(8, dtype=torch.int32, device=device)
+    token_indices[1, :5] = torch.tensor(
+        [1, 3, 4, 6, 7], dtype=torch.int32, device=device
+    )
+    req_id = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[10], [20]], dtype=torch.int32, device=device)
+    indptr = torch.empty(3, dtype=torch.int32, device=device)
+    physical = torch.empty(2 * topk, dtype=torch.int32, device=device)
+
+    counts = prepare_dcp_sparse_indices(
+        req_id,
+        block_table,
+        token_indices,
+        indptr,
+        physical,
+        dcp_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=1,
+        block_size=block_size,
+    )
+    torch.accelerator.synchronize()
+
+    assert counts.cpu().tolist() == [4, 2]
+    assert indptr.cpu().tolist() == [0, 4, 6]
+    assert set(physical[:4].cpu().tolist()) == {40, 41, 42, 43}
+    assert set(physical[4:6].cpu().tolist()) == {82, 83}
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

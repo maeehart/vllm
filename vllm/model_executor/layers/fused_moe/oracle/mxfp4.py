@@ -669,7 +669,12 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     activation: MoEActivation | None = None,
 ) -> tuple[int, int]:
     """Round up hidden_size and intermediate_size based on backend requirements."""
-    if backend in B12X_BACKENDS:
+    if envs.VLLM_ROCM_GLM52_CPX_TP64 and backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+        return (
+            round_up(hidden_size, OCP_MX_BLOCK_SIZE),
+            round_up(intermediate_size, OCP_MX_BLOCK_SIZE),
+        )
+    elif backend in B12X_BACKENDS:
         # b12x plans for the exact model dimensions. B12xExperts validates the
         # required MXFP4 block alignment before selecting the backend.
         return hidden_size, intermediate_size
@@ -699,7 +704,13 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif current_platform.is_rocm():
-        if backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and (
+        use_cpx_a4w4 = backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4 and (
+            envs.VLLM_ROCM_GLM52_CPX_TP16 or envs.VLLM_ROCM_GLM52_CPX_TP32
+        )
+        if use_cpx_a4w4:
+            intermediate_size = round_up(intermediate_size, 128)
+            hidden_size = round_up(hidden_size, 128)
+        elif backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and (
             activation == MoEActivation.SITU or activation == MoEActivation.SILU
         ):
             # K3's AITER A16W4 SiTU kernel handles K3's native intermediate size
@@ -1029,14 +1040,14 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         from aiter.utility.fp4_utils import e8m0_shuffle
 
         s0, s1, _ = w13_weight_scale.shape
-        w13_weight_scale.data = e8m0_shuffle(w13_weight_scale.view(s0 * s1, -1)).view(
-            s0, s1, -1
-        )
+        w13_weight_scale.data = e8m0_shuffle(w13_weight_scale.view(s0 * s1, -1))[
+            : s0 * s1
+        ].view(s0, s1, -1)
 
         s0, s1, _ = w2_weight_scale.shape
-        w2_weight_scale.data = e8m0_shuffle(w2_weight_scale.view(s0 * s1, -1)).view(
-            s0, s1, -1
-        )
+        w2_weight_scale.data = e8m0_shuffle(w2_weight_scale.view(s0 * s1, -1))[
+            : s0 * s1
+        ].view(s0, s1, -1)
 
         # View as native FP4 dtype
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -1044,12 +1055,23 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w13_weight.data = w13_weight.data.view(fp4_dtype)
             w2_weight.data = w2_weight.data.view(fp4_dtype)
 
-        # Shuffle weights for AITER CK kernel
-        shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
-            w13_weight, w2_weight
-        )
+        if envs.VLLM_ROCM_GLM52_CPX_TP64:
+            # TP64 has a native per-rank intermediate size of 32. Keep W2 in
+            # compact row-major FP4 form for AITER's compact-K32 GEMM2, while
+            # retaining the standard preshuffle for GEMM1's hidden-K operand.
+            from aiter.ops.shuffle import shuffle_weight
+
+            shuffled_w13 = shuffle_weight(w13_weight, (16, 16))
+            shuffled_w2 = w2_weight.contiguous()
+            shuffled_w2.compact_k32 = True
+        else:
+            # Shuffle weights for AITER CK/FlyDSL kernels.
+            shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
+                w13_weight, w2_weight
+            )
         shuffled_w13.is_shuffled = True
-        shuffled_w2.is_shuffled = True
+        if not envs.VLLM_ROCM_GLM52_CPX_TP64:
+            shuffled_w2.is_shuffled = True
 
         return (
             shuffled_w13,

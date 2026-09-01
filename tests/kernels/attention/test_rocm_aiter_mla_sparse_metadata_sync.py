@@ -68,6 +68,9 @@ def _make_builder():
     builder._prev_req_extent = 0
     builder._prev_indices_extent = 0
     builder._prev_metadata_key = None
+    builder.dcp_world_size = 1
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
     return builder
 
 
@@ -200,3 +203,24 @@ def test_sparse_persistent_metadata_syncs_only_after_recompute(monkeypatch):
 
     assert events == []
     assert fake_get_mla_metadata_v1_mock.call_count == 1
+
+
+def test_dcp_build_disables_global_persistent_metadata(monkeypatch):
+    builder = _make_builder()
+    builder.dcp_world_size = 4
+    builder.dcp_rank = 2
+    builder.cp_kv_cache_interleave_size = 1
+    _patch_build_deps(monkeypatch)
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=_make_common_metadata(),
+    )
+
+    assert metadata.cp_kv_cache_interleave_size == 1
+    assert metadata.work_meta_data is None
+    assert metadata.work_indptr is None
+    assert metadata.work_info_set is None
+    assert metadata.reduce_indptr is None
+    assert metadata.reduce_final_map is None
+    assert metadata.reduce_partial_map is None

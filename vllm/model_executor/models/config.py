@@ -26,8 +26,17 @@ class VerifyAndUpdateConfig:
         return
 
 
-def _verify_glm52_cpx_tp16_config(vllm_config: "VllmConfig") -> None:
-    if not envs.VLLM_ROCM_GLM52_CPX_TP16:
+def _verify_glm52_cpx_config(vllm_config: "VllmConfig") -> None:
+    topology_flags = {
+        16: envs.VLLM_ROCM_GLM52_CPX_TP16,
+        32: envs.VLLM_ROCM_GLM52_CPX_TP32,
+        64: envs.VLLM_ROCM_GLM52_CPX_TP64,
+    }
+    enabled_tp_sizes = [size for size, enabled in topology_flags.items() if enabled]
+    if len(enabled_tp_sizes) > 1:
+        raise ValueError("Only one GLM-5.2 CPX topology flag may be enabled.")
+    expected_tp_size = enabled_tp_sizes[0] if enabled_tp_sizes else None
+    if expected_tp_size is None:
         return
 
     from vllm.platforms import current_platform
@@ -48,8 +57,8 @@ def _verify_glm52_cpx_tp16_config(vllm_config: "VllmConfig") -> None:
         "num_experts_per_tok": 8,
         "n_shared_experts": 1,
         "quant_method": "quark",
-        "tensor_parallel_size": 16,
-        "intermediate_size_per_partition": 128,
+        "tensor_parallel_size": expected_tp_size,
+        "intermediate_size_per_partition": 2048 // expected_tp_size,
         "enable_expert_parallel": False,
         "VLLM_ROCM_USE_AITER": True,
         "VLLM_ROCM_USE_AITER_MOE": True,
@@ -92,11 +101,14 @@ def _verify_glm52_cpx_tp16_config(vllm_config: "VllmConfig") -> None:
             for key, item in mismatches.items()
         )
         raise ValueError(
-            "VLLM_ROCM_GLM52_CPX_TP16=1 requires the validated "
-            f"GLM-5.2 MXFP4 AITER TP16 configuration: {details}"
+            f"VLLM_ROCM_GLM52_CPX_TP{expected_tp_size}=1 requires the "
+            f"validated GLM-5.2 MXFP4 AITER configuration: {details}"
         )
 
-    logger.info("Validated GLM-5.2 MXFP4 CPX/TP16 model and AITER configuration.")
+    logger.info(
+        "Validated GLM-5.2 MXFP4 CPX/TP%d model and AITER configuration.",
+        expected_tp_size,
+    )
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -117,7 +129,7 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
 class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        _verify_glm52_cpx_tp16_config(vllm_config)
+        _verify_glm52_cpx_config(vllm_config)
         # For Glm-Moe-DSA, qrep + a2a is better than the default all-gather + ag-rs
         # in most cases.
         vllm_config.parallel_config.set_dcp_defaults(

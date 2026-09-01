@@ -11,6 +11,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
@@ -29,6 +30,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
     AiterMLAHelper,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -162,6 +166,77 @@ def triton_convert_req_index_to_global_index(
         ti_stride1,
     )
     return
+
+
+@triton.jit
+def _pack_compacted_dcp_indices_kernel(
+    compacted_ptr,
+    valid_counts_ptr,
+    indptr_ptr,
+    output_ptr,
+    compacted_stride0,
+    compacted_stride1,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid_count = tl.load(valid_counts_ptr + row)
+    mask = (cols < TOPK) & (cols < valid_count)
+    values = tl.load(
+        compacted_ptr + row * compacted_stride0 + cols * compacted_stride1,
+        mask=mask,
+    )
+    output_start = tl.load(indptr_ptr + row)
+    tl.store(output_ptr + output_start + cols, values, mask=mask)
+
+
+def prepare_dcp_sparse_indices(
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    token_indices: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Filter global sparse indices and pack this rank's physical slots."""
+    compacted, valid_counts = triton_filter_and_convert_dcp_index(
+        req_id,
+        block_table,
+        token_indices,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=token_indices.shape[1],
+        return_valid_counts=True,
+    )
+    num_rows = token_indices.shape[0]
+    paged_kv_indptr[0] = 0
+    torch.cumsum(
+        valid_counts,
+        dim=0,
+        out=paged_kv_indptr[1 : num_rows + 1],
+    )
+    tile = 256
+    _pack_compacted_dcp_indices_kernel[
+        (num_rows, triton.cdiv(token_indices.shape[1], tile))
+    ](
+        compacted,
+        valid_counts,
+        paged_kv_indptr,
+        paged_kv_indices,
+        compacted.stride(0),
+        compacted.stride(1),
+        TOPK=token_indices.shape[1],
+        BLOCK_SIZE=tile,
+        num_warps=4,
+    )
+    return valid_counts
 
 
 @triton.jit
@@ -323,6 +398,7 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
 
     block_size: int = 1
     topk_tokens: int = 2048
+    cp_kv_cache_interleave_size: int = 1
 
     # Fields read by the shared MLA forward. This impl has no dense-MHA prefill
     # path (supports_dense_mha_prefill=False), so it always runs the MQA path;
@@ -361,6 +437,9 @@ class ROCMAiterMLASparseMetadataBuilder(
         parallel_config = vllm_config.parallel_config
         self.device = device
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
 
         self.vllm_config = vllm_config
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
@@ -566,7 +645,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             clamped_context_lens.tobytes(),
             seg_lengths.tobytes(),
         )
-        if metadata_key != self._prev_metadata_key:
+        if self.dcp_world_size == 1 and metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
 
             max_split_per_batch = self._sparse_decode_max_split(
@@ -609,6 +688,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             block_size=self.kv_cache_spec.block_size,
             attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
@@ -616,12 +696,22 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            work_meta_data=self._mla_work_meta_data,
-            work_indptr=self._mla_work_indptr,
-            work_info_set=self._mla_work_info_set,
-            reduce_indptr=self._mla_reduce_indptr,
-            reduce_final_map=self._mla_reduce_final_map,
-            reduce_partial_map=self._mla_reduce_partial_map,
+            work_meta_data=(
+                self._mla_work_meta_data if self.dcp_world_size == 1 else None
+            ),
+            work_indptr=self._mla_work_indptr if self.dcp_world_size == 1 else None,
+            work_info_set=(
+                self._mla_work_info_set if self.dcp_world_size == 1 else None
+            ),
+            reduce_indptr=(
+                self._mla_reduce_indptr if self.dcp_world_size == 1 else None
+            ),
+            reduce_final_map=(
+                self._mla_reduce_final_map if self.dcp_world_size == 1 else None
+            ),
+            reduce_partial_map=(
+                self._mla_reduce_partial_map if self.dcp_world_size == 1 else None
+            ),
         )
         return metadata
 
@@ -658,6 +748,7 @@ def reference_mla_sparse_prefill(
 class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
     is_sparse = True
     supports_dense_mha_prefill = False
+    can_return_lse_for_decode = True
 
     def __init__(
         self,
@@ -705,9 +796,10 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
         q: torch.Tensor,  # [sq, heads, d_qk]
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         attn_metadata: ROCMAiterMLASparseMetadata,
-    ) -> torch.Tensor:
+        num_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_tokens = q.shape[0]
-        mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(self.num_heads)
+        mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(num_heads)
         output = torch.empty(
             [num_tokens, mla_num_heads, self.kv_lora_rank],
             dtype=attn_metadata.attn_out_dtype,
@@ -731,7 +823,7 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
                 reduce_partial_map=attn_metadata.reduce_partial_map,
             )
 
-        rocm_aiter_ops.mla_decode_fwd(
+        result = rocm_aiter_ops.mla_decode_fwd(
             q,
             kv_c_and_k_pe_cache,
             output,
@@ -741,10 +833,22 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
             attn_metadata.paged_kv_indptr,
             attn_metadata.paged_kv_indices,
             attn_metadata.paged_kv_last_page_len,
+            return_lse=self.need_to_return_lse_for_decode,
             **mla_kwargs,
         )
 
-        return AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
+        output = AiterMLAHelper.get_mla_unpadded_o(num_heads, output)
+        if not self.need_to_return_lse_for_decode:
+            return output, None
+
+        assert isinstance(result, torch.Tensor)
+        lse = result
+        if lse.shape[1] != num_heads:
+            if lse.shape[1] % num_heads == 0:
+                lse = lse[:, :: lse.shape[1] // num_heads]
+            else:
+                lse = lse[:, :num_heads]
+        return output, lse.contiguous()
 
     def forward_mqa(
         self,
@@ -773,15 +877,29 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
-        )
+        valid_counts = None
+        if self.dcp_world_size > 1:
+            valid_counts = prepare_dcp_sparse_indices(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
+                block_size=attn_metadata.block_size,
+            )
+        else:
+            triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            )
 
         # write the latent and rope to kv cache
         if fp8_attention:
@@ -790,9 +908,20 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
                 original_q_shape = q.shape
                 q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
                 q = q.view(original_q_shape)
-        mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
-        attn_out = self._forward_mla(
-            layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata
+        runtime_num_heads = q.shape[1]
+        mla_padded_q = AiterMLAHelper.get_mla_padded_q(runtime_num_heads, q)
+        attn_out, lse = self._forward_mla(
+            layer,
+            mla_padded_q,
+            kv_c_and_k_pe_cache,
+            attn_metadata,
+            runtime_num_heads,
         )
 
-        return attn_out, None
+        if valid_counts is not None:
+            empty_rows = valid_counts == 0
+            attn_out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+            assert lse is not None
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+
+        return attn_out.contiguous(), lse

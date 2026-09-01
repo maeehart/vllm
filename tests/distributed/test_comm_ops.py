@@ -402,6 +402,50 @@ def test_flashinfer_all_reduce_precedes_nccl(monkeypatch: pytest.MonkeyPatch) ->
     nccl_selector.assert_not_called()
 
 
+def test_cpx_exact_all_reduce_uses_device_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.fi_ar_comm = None
+    communicator.pynccl_comm = None
+    communicator.use_exact_allreduce_for_cpx = True
+    communicator.device_group = Mock()
+    all_reduce = Mock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    input_tensor = torch.tensor([1.0, 2.0])
+    output = communicator.all_reduce(input_tensor)
+
+    assert output is not input_tensor
+    torch.testing.assert_close(output, input_tensor)
+    all_reduce.assert_called_once_with(output, group=communicator.device_group)
+
+
+def test_cpx_dcp_uses_existing_device_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.fi_ar_comm = None
+    communicator.pynccl_comm = None
+    communicator.qr_comm = None
+    communicator.aiter_ar_comm = None
+    communicator.ca_comm = None
+    communicator.symm_mem_comm = None
+    communicator.use_exact_allreduce_for_cpx = False
+    communicator.skip_pynccl_for_cpx = True
+    communicator.use_pytorch_collectives_for_cpx_dcp = True
+    communicator.device_group = Mock()
+    all_reduce = Mock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    input_tensor = torch.tensor([1.0, 2.0])
+    output = communicator.all_reduce(input_tensor)
+
+    assert output is not input_tensor
+    torch.testing.assert_close(output, input_tensor)
+    all_reduce.assert_called_once_with(output, group=communicator.device_group)
+
+
 def test_async_intermediate_tensors_lazy_wait() -> None:
     work = _DummyWork()
     post_calls = {"n": 0}

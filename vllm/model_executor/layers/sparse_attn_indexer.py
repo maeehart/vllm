@@ -769,7 +769,11 @@ class SparseAttnIndexer(CustomOp):
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         parallel_config = get_current_vllm_config().parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_world_size = (
+            1
+            if getattr(k_cache, "replicate_dcp_cache", False)
+            else parallel_config.decode_context_parallel_size
+        )
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
@@ -876,6 +880,9 @@ class SparseAttnIndexer(CustomOp):
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
                 compress_ratio=self.compress_ratio,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

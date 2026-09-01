@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import math
+import os
 
 import multiprocess as mp
 import pytest
@@ -17,6 +18,7 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.config.parallel import ParallelConfig
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_file_store_init_method
 from vllm.utils.system_utils import update_environment_variables
 
@@ -404,7 +406,13 @@ class TestPackedA2AKernels:
         if return_lse:
             actual_out, actual_lse = actual
             _assert_packed_a2a_close(actual_out, expected_out, dtype)
-            torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
+            assert actual_lse.dtype == torch.float32
+            torch.testing.assert_close(
+                actual_lse,
+                expected_lse.float(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
 
@@ -558,7 +566,13 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         if return_lse:
             actual_out, actual_lse = actual
             _assert_packed_a2a_close(actual_out, expected_out, dtype)
-            torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
+            assert actual_lse.dtype == torch.float32
+            torch.testing.assert_close(
+                actual_lse,
+                expected_lse.float(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
     finally:
@@ -566,6 +580,80 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             from vllm.v1.worker.workspace import reset_workspace_manager
 
             reset_workspace_manager()
+        dist.destroy_process_group()
+
+
+def _distributed_ag_rs_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    rank = int(env["RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(
+        backend=current_platform.dist_backend,
+        init_method=env["DISTRIBUTED_INIT_METHOD"],
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        local = torch.full(
+            (4,),
+            rank + 1,
+            dtype=torch.bfloat16,
+            device=f"cuda:{local_rank}",
+        )
+        gathered = torch.empty(
+            world_size * local.numel(),
+            dtype=local.dtype,
+            device=local.device,
+        )
+        dist.all_gather_into_tensor(gathered, local)
+        for source_rank in range(world_size):
+            torch.testing.assert_close(
+                gathered[source_rank * 4 : (source_rank + 1) * 4],
+                torch.full_like(local, source_rank + 1),
+            )
+
+        reduce_input = torch.full(
+            (world_size * 4,),
+            rank + 1,
+            dtype=torch.bfloat16,
+            device=local.device,
+        )
+        reduced = torch.empty_like(local)
+        dist.reduce_scatter_tensor(reduced, reduce_input)
+        torch.testing.assert_close(
+            reduced,
+            torch.full_like(reduced, world_size * (world_size + 1) // 2),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_allreduce_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    rank = int(env["RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(
+        backend=current_platform.dist_backend,
+        init_method=env["DISTRIBUTED_INIT_METHOD"],
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        for dtype in (torch.bfloat16, torch.float32, torch.uint8):
+            value = 7 if rank == 0 else 0
+            tensor = torch.full(
+                (16,),
+                value,
+                dtype=dtype,
+                device=f"cuda:{local_rank}",
+            )
+            dist.all_reduce(tensor)
+            torch.testing.assert_close(tensor, torch.full_like(tensor, 7))
+    finally:
         dist.destroy_process_group()
 
 
@@ -582,6 +670,33 @@ def test_distributed_packed_a2a_matches_reference(dtype_name: str):
             "RETURN_LSE": "1",
             "LSE_BASE_E": "1",
         },
+    )
+
+
+_AG_RS_WORLD_SIZE = int(os.getenv("VLLM_TEST_DCP_AG_RS_WORLD_SIZE", "4"))
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < _AG_RS_WORLD_SIZE,
+    reason="Not enough GPUs for the requested AG/RS world size.",
+)
+def test_distributed_ag_rs_collectives():
+    _distributed_run(
+        _distributed_ag_rs_worker,
+        world_size=_AG_RS_WORLD_SIZE,
+        extra_env={},
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < _AG_RS_WORLD_SIZE,
+    reason="Not enough GPUs for the requested all-reduce world size.",
+)
+def test_distributed_allreduce_collective():
+    _distributed_run(
+        _distributed_allreduce_worker,
+        world_size=_AG_RS_WORLD_SIZE,
+        extra_env={},
     )
 
 

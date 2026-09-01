@@ -75,5 +75,85 @@ def test_mla_decode_fwd_op_schema() -> None:
             "reduce_indptr": None,
             "reduce_final_map": None,
             "reduce_partial_map": None,
+            "return_lse": True,
         },
+    )
+
+
+@torch.inference_mode()
+def test_mla_decode_fwd_dcp_lse_merge_matches_global_attention() -> None:
+    _require_aiter()
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    torch.manual_seed(23)
+    num_tokens = 32
+    num_heads = 32
+    scale = Q_HEAD_DIM**-0.5
+    q = (
+        torch.randn(
+            1,
+            num_heads,
+            Q_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.125
+    )
+    global_kv = (
+        torch.randn(
+            num_tokens,
+            Q_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.125
+    )
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+    partial_outputs = []
+    partial_lses = []
+    for rank in range(2):
+        local_kv = global_kv[rank::2].contiguous()
+        output = torch.empty(
+            1,
+            num_heads,
+            V_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        local_tokens = local_kv.shape[0]
+        lse = rocm_aiter_ops.mla_decode_fwd(
+            q,
+            local_kv,
+            output,
+            scale,
+            qo_indptr,
+            1,
+            torch.tensor([0, local_tokens], dtype=torch.int32, device="cuda"),
+            torch.arange(local_tokens, dtype=torch.int32, device="cuda"),
+            torch.ones(1, dtype=torch.int32, device="cuda"),
+            return_lse=True,
+        )
+        partial_outputs.append(output.float())
+        partial_lses.append(lse.float())
+
+    partial_lses_tensor = torch.stack(partial_lses)
+    merged_lse = torch.logsumexp(partial_lses_tensor, dim=0)
+    weights = torch.exp(partial_lses_tensor - merged_lse.unsqueeze(0))
+    merged = (torch.stack(partial_outputs) * weights.unsqueeze(-1)).sum(dim=0)
+
+    scores = torch.einsum("bhd,sd->bhs", q.float(), global_kv.float()) * scale
+    reference_lse = torch.logsumexp(scores, dim=-1)
+    reference = torch.einsum(
+        "bhs,sv->bhv",
+        torch.softmax(scores, dim=-1),
+        global_kv[:, :V_HEAD_DIM].float(),
+    )
+
+    torch.testing.assert_close(merged, reference, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        merged_lse,
+        reference_lse,
+        atol=2e-2,
+        rtol=2e-2,
     )

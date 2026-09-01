@@ -68,6 +68,14 @@ if current_platform.is_rocm():
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_rocm_aiter_sparse_mla_exposes_dcp_lse_contract():
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+        ROCMAiterMLASparseImpl,
+    )
+
+    assert ROCMAiterMLASparseImpl.can_return_lse_for_decode
+
+
 @pytest.mark.parametrize(
     ("cache_dtype", "expected_quant_mode"),
     [

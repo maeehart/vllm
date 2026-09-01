@@ -640,6 +640,17 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        parallel_config = get_current_vllm_config().parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.replicate_dcp_cache = (
+            current_platform.is_rocm()
+            and envs.VLLM_ROCM_GLM52_DCP_REPLICATE_INDEXER_CACHE
+            and self.dcp_world_size > 1
+        )
+        if self.replicate_dcp_cache and self.dtype != torch.uint8:
+            raise ValueError(
+                "GLM-5.2 CPX replicated DSA cache requires uint8 FP8 storage."
+            )
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -648,7 +659,14 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]: the indexer kernels and
         # kv_cache_as_quant_view index a 3-D block-major cache.
-        self.kv_cache = kv_cache.squeeze(1)
+        kv_cache = kv_cache.squeeze(1)
+        if self.replicate_dcp_cache:
+            kv_cache = kv_cache.view(
+                kv_cache.shape[0],
+                kv_cache.shape[1] * self.dcp_world_size,
+                self.head_dim,
+            )
+        self.kv_cache = kv_cache
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return MLAAttentionSpec(
@@ -656,6 +674,11 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            state_content_bytes=(
+                self.head_dim * self.dcp_world_size
+                if self.replicate_dcp_cache
+                else None
+            ),
         )  # Only has one vector instead of K + V
 
     def forward(self): ...

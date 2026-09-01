@@ -88,18 +88,10 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._flydsl_qr = None
         if not self._rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
-            )
-            return
-
-        if not quick_ar:
-            # disable because of missing quick reduce library
-            # e.g. in a cuda environment
-            logger.info(
-                "Custom quick allreduce is disabled because "
-                "of missing custom quick allreduce library"
             )
             return
 
@@ -123,21 +115,36 @@ class QuickAllReduce:
             # No need to initialize QuickReduce for single GPU case.
             return
 
-        if world_size not in QuickAllReduce._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "Custom quick allreduce is disabled due to an "
-                "unsupported world size: %d. Supported world sizes: %s.",
-                world_size,
-                str(QuickAllReduce._SUPPORTED_WORLD_SIZES),
-            )
-            return
-
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
         assert isinstance(device, torch.device)
         self.device = device
+
+        use_flydsl_qr = (world_size == 16 and envs.VLLM_ROCM_GLM52_CPX_TP16) or (
+            world_size == 32 and envs.VLLM_ROCM_GLM52_CPX_TP32
+        )
+        if use_flydsl_qr:
+            self.init_flydsl_quick_all_reduce()
+            return
+
+        if not quick_ar:
+            # Disable because of a missing HIP QuickReduce library.
+            logger.info(
+                "Custom quick allreduce is disabled because "
+                "of missing custom quick allreduce library"
+            )
+            return
+
+        if world_size not in self._SUPPORTED_WORLD_SIZES:
+            logger.warning(
+                "Custom quick allreduce is disabled due to an "
+                "unsupported world size: %d. Supported world sizes: %s.",
+                world_size,
+                str(self._SUPPORTED_WORLD_SIZES),
+            )
+            return
 
         # device.index is a visible ordinal, not a logical local ID.
         physical_device_id = current_platform.visible_device_id_to_physical_device_id(
@@ -164,6 +171,31 @@ class QuickAllReduce:
             return
 
         self.init_quick_all_reduce()
+
+    def init_flydsl_quick_all_reduce(self) -> None:
+        from aiter.ops.flydsl.kernels.qr_int4 import QRInt4
+
+        self._flydsl_qr = QRInt4(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+            super_tile=1,
+        )
+        compile_input = torch.zeros(8, dtype=torch.bfloat16, device=self.device)
+        compile_output = torch.empty_like(compile_input)
+        self._flydsl_qr.compile(compile_input, compile_output)
+        torch.cuda.synchronize(self.device)
+        self.use_fp16_kernels = False
+        self.qr_quant_level = QuickReduceRegime.INT4
+        self.qr_quantization_min_size = None
+        self.qr_min_size = 0
+        self.qr_max_size = None
+        self.disabled = False
+        logger.info(
+            "Using FlyDSL QRInt4 for gfx950 CPX TP%d all-reduce.",
+            self.world_size,
+        )
 
     def init_quick_all_reduce(self):
         # On RocM, bfloat16 kernels are slower than fp16
@@ -317,6 +349,13 @@ class QuickAllReduce:
         """
         if self.disabled:
             return False
+        if self._flydsl_qr is not None:
+            return (
+                inp.dtype == torch.bfloat16
+                and inp.is_cuda
+                and inp.numel() * inp.element_size() % 16 == 0
+                and is_weak_contiguous(inp)
+            )
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -342,6 +381,9 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._flydsl_qr is not None:
+            self._flydsl_qr.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self._get_qr_quant_level(inp), self.use_fp16_kernels
         )
@@ -357,6 +399,11 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        if self._flydsl_qr is not None:
+            self._flydsl_qr.close()
+            self._flydsl_qr = None
+            self.disabled = True
+            return
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

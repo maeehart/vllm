@@ -66,10 +66,55 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
 
+        cpx_topologies = {
+            16: envs.VLLM_ROCM_GLM52_CPX_TP16,
+            32: envs.VLLM_ROCM_GLM52_CPX_TP32,
+            64: envs.VLLM_ROCM_GLM52_CPX_TP64,
+        }
+        enabled_cpx_world_sizes = [
+            size for size, enabled in cpx_topologies.items() if enabled
+        ]
+        if len(enabled_cpx_world_sizes) > 1:
+            raise ValueError("Only one GLM-5.2 CPX topology flag may be enabled.")
+        cpx_world_size = enabled_cpx_world_sizes[0] if enabled_cpx_world_sizes else None
+        is_cpx_full_width_group = (
+            cpx_world_size is not None
+            and self.world_size == cpx_world_size
+            and current_platform.is_rocm()
+            and ("tp" in unique_name or "ep" in unique_name)
+        )
+        use_pytorch_collectives_for_cpx_dcp = (
+            cpx_world_size is not None
+            and current_platform.is_rocm()
+            and "dcp" in unique_name
+        )
+        skip_pynccl_for_cpx = (
+            is_cpx_full_width_group or use_pytorch_collectives_for_cpx_dcp
+        )
+        use_exact_allreduce_for_cpx = is_cpx_full_width_group and (
+            cpx_world_size == 64 or envs.VLLM_ROCM_GLM52_CPX_EXACT_ALLREDUCE
+        )
+        use_flydsl_qr_cpx = (
+            skip_pynccl_for_cpx
+            and "tp" in unique_name
+            and not use_exact_allreduce_for_cpx
+        )
+        if use_flydsl_qr_cpx:
+            use_aiter_allreduce = False
+        if use_exact_allreduce_for_cpx:
+            use_custom_allreduce = False
+            use_torch_symm_mem = False
+            use_flashinfer_allreduce = False
+            use_aiter_allreduce = False
+
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_flydsl_qr_cpx = use_flydsl_qr_cpx
+        self.use_exact_allreduce_for_cpx = use_exact_allreduce_for_cpx
+        self.use_pytorch_collectives_for_cpx_dcp = use_pytorch_collectives_for_cpx_dcp
+        self.skip_pynccl_for_cpx = skip_pynccl_for_cpx
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -85,7 +130,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
+        if self.world_size > 1 and not self.skip_pynccl_for_cpx:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,
@@ -117,7 +162,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
+        if (
+            use_custom_allreduce
+            and not self.use_flydsl_qr_cpx
+            and self.aiter_ar_comm is None
+            and self.world_size > 1
+        ):
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -127,7 +177,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
+        if (
+            use_custom_allreduce
+            and self.world_size > 1
+            and current_platform.is_rocm()
+            and not self.use_exact_allreduce_for_cpx
+        ):
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
             # (vLLM's or AITER's), so it is initialized for either backend.
@@ -220,6 +275,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "TORCH_EXACT",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
@@ -229,6 +285,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.use_exact_allreduce_for_cpx:
+            enabled_ar_backends.append("TORCH_EXACT")
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
@@ -293,6 +351,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
+        if self.use_exact_allreduce_for_cpx:
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+            return out
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -302,6 +364,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
             return out
+        if self.skip_pynccl_for_cpx and not self.use_pytorch_collectives_for_cpx_dcp:
+            raise RuntimeError(
+                "The GLM-5.2 CPX path disabled PyNCCL for this group, "
+                f"but no optimized all-reduce accepted dtype={input_.dtype}, "
+                f"shape={tuple(input_.shape)}, contiguous={input_.is_contiguous()}."
+            )
         if use_fi_ar:
             assert fi_ar_comm is not None
             out = fi_ar_comm.all_reduce(input_)
@@ -370,6 +438,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            # The CPX path skips the duplicate PyNCCL wrapper, but its primary
+            # device process group remains available for exact all-gathers.
             return super().all_gather(input_, dim)
 
         # On ROCm, the base-class all_gather (all_gather_into_tensor) is faster
@@ -594,6 +664,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm.close()
+            self.qr_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
