@@ -105,6 +105,7 @@ steps:
   - tests/kernels/models/amd/test_dsv41_gfx942_fused_markov.py
   - tests/kernels/models/amd/test_dsv41_gfx942_draft_lm_head.py
   - tests/kernels/models/amd/test_dsv41_mono_gfx942.py
+  - tests/kernels/models/amd/test_dsv41_largestep_moe.py
   commands:
   - >-
     pytest -v -s
@@ -115,6 +116,7 @@ steps:
     tests/kernels/models/amd/test_dsv41_gfx942_fused_markov.py
     tests/kernels/models/amd/test_dsv41_gfx942_draft_lm_head.py
     tests/kernels/models/amd/test_dsv41_mono_gfx942.py
+    tests/kernels/models/amd/test_dsv41_largestep_moe.py
 
 - label: ':amd: (MI355) DeepSeek-V4-Pro Mono Decode Numerics'
   key: dsv4-mono-decode-numerics-amd
