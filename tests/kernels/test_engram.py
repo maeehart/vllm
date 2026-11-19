@@ -585,6 +585,38 @@ def _hash_ids(requests, tables_meta, capture=False):
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="CUDA or ROCm required"
 )
+def test_step_hashes_survive_a_split_inside_a_request():
+    """Dual batch overlap can split a step inside one request's chunk. The
+    model state hashes the whole step and gives each microbatch its rows, so
+    the rows after the split equal the unsplit hashes. Hashing the second
+    microbatch on its own lacks the tokens before the split (negative
+    control)."""
+    tables_meta = (
+        torch.arange(50, dtype=torch.int32, device="cuda"),
+        torch.tensor([[3, 5, 7, 9]], device="cuda"),
+        torch.tensor([[[97, 89], [83, 79], [73, 71]]], device="cuda"),
+        torch.tensor([[0, 97, 186, 269, 348, 421]], device="cuda"),
+    )
+    tokens = [11, 12, 13, 15, 16, 17, 18, 19, 20, 21]
+    whole = _hash_ids([(tokens, 0, None)], tables_meta)[0]
+    split = 6
+    # The model state's whole-step hashes, sliced as `slice_model_inputs` does.
+    from vllm.v1.worker.gpu.ubatch_utils import slice_model_inputs
+
+    inputs = {
+        "input_ids": torch.tensor(tokens, device="cuda"),
+        "positions": torch.arange(len(tokens), device="cuda"),
+        "engram_hashes": whole,
+    }
+    second = slice_model_inputs(inputs, slice(split, len(tokens)))
+    assert torch.equal(second["engram_hashes"], whole[split:])
+    alone = _hash_ids([(tokens[split:], 0, None)], tables_meta)[0]
+    assert not torch.equal(alone[0], whole[split])
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="CUDA or ROCm required"
+)
 @pytest.mark.parametrize("capture", [False, True])
 def test_lookback_window_reproduces_single_instance(capture):
     """Decoding on a fresh instance whose prompt KV came from elsewhere (P/D,
