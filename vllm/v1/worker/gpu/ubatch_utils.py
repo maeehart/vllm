@@ -259,12 +259,17 @@ def _slice_seq_lens(
     return out
 
 
+# Model inputs with one row per token that a model state may add; each
+# microbatch gets its own rows of them.
+PER_TOKEN_MODEL_INPUTS = ("engram_hashes",)
+
+
 def slice_model_inputs(
     model_inputs: dict[str, Any], token_slice: slice
 ) -> dict[str, Any]:
     """Narrow the model's per-token inputs to one microbatch."""
     sliced = dict(model_inputs)
-    for key in ("input_ids", "inputs_embeds"):
+    for key in ("input_ids", "inputs_embeds", *PER_TOKEN_MODEL_INPUTS):
         value = model_inputs.get(key)
         if value is not None:
             sliced[key] = value[token_slice]

@@ -309,6 +309,9 @@ class DeepseekV41ForCausalLM(
     def decoder_replay_layers(self) -> DecoderReplayLayers | None:
         return self.language_model.decoder_replay_layers
 
+    def engram_step_hashes(self, *args) -> torch.Tensor | None:
+        return self.language_model.engram_step_hashes(*args)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -316,6 +319,7 @@ class DeepseekV41ForCausalLM(
         intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.language_model(
@@ -324,6 +328,7 @@ class DeepseekV41ForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            engram_hashes=engram_hashes,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

@@ -242,6 +242,9 @@ class DeepseekV41ModelState(DefaultModelState):
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         max_local_reqs = self.max_num_reqs * (2 if self.pcp_size > 1 else 1)
         depth = model.token_lookback_depth
+        self.use_ubatching = vllm_config.parallel_config.use_ubatching and hasattr(
+            model, "engram_step_hashes"
+        )
         self.lookback_token_ids: torch.Tensor | None = None
         if depth > 0:
             # Persistent so a captured graph can read it on replay.
@@ -346,6 +349,19 @@ class DeepseekV41ModelState(DefaultModelState):
             return model_inputs
         self._fill_lookback(input_batch, req_states)
         model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        if self.use_ubatching:
+            # A microbatch can start inside a request's chunk, where its own
+            # tokens and the request's lookback row do not hold the two tokens
+            # before its first token. The hashes are therefore computed here
+            # for the whole step, and each microbatch takes its rows.
+            hashes = self.model.engram_step_hashes(
+                input_batch.input_ids[: input_batch.num_tokens_after_padding],
+                input_batch.positions[: input_batch.num_tokens_after_padding],
+                input_batch.query_start_loc,
+                self.lookback_token_ids,
+            )
+            if hashes is not None:
+                model_inputs["engram_hashes"] = hashes
         return model_inputs
 
     def _fill_lookback(self, input_batch: InputBatch, req_states: RequestState) -> None:

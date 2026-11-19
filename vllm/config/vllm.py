@@ -1572,10 +1572,12 @@ class VllmConfig:
             and model_config.architecture == "DeepseekV41ForCausalLM"
             and getattr(model_config.hf_text_config, "engram_layer_ids", None)
             and self.parallel_config.use_ubatching
+            and not self._engram_supports_ubatching()
         ):
             raise ValueError(
-                "DeepSeek V4.1 Engram does not support DBO or microbatching. "
-                "Disable --enable-dbo and set --ubatch-size to 0."
+                "DeepSeek V4.1 Engram supports microbatching only on ROCm with "
+                "--dbo-schedule all-reduce-overlap and one DP rank. Disable "
+                "--enable-dbo and set --ubatch-size to 0."
             )
         if self.engram_config is None:
             if not model_has_engram_layers(model_config):
@@ -1585,6 +1587,19 @@ class VllmConfig:
         self.engram_config.resolve_dp_shared_memory(self.parallel_config, model_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
+
+    def _engram_supports_ubatching(self) -> bool:
+        """Whether the DeepSeek V4.1 Engram path can run in microbatches: the
+        ROCm model state computes the step's n-gram hashes before the split,
+        and each microbatch stages its rows at its own offset. DP-shared or
+        DP-gathered tables exchange rows between replicas per step, which the
+        split does not follow."""
+        parallel_config = self.parallel_config
+        return (
+            current_platform.is_rocm()
+            and parallel_config.dbo_schedule == "all-reduce-overlap"
+            and parallel_config.data_parallel_size == 1
+        )
 
     def _reject_mismatched_float_kv_cache(self) -> None:
         """Reject an explicit float16/bfloat16 KV dtype that differs from the model."""

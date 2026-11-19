@@ -827,6 +827,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             }
         )
 
+    def engram_step_hashes(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The Engram n-gram hashes of every token of a step, for a model state
+        that splits the step into microbatches before the forward. None when
+        this rank has no Engram layer, or during the memory profile (the KV
+        cache is unbound, and the forward then uses dead rows)."""
+        if (
+            self.engram_hash is None
+            or lookback_token_ids is None
+            or not self.engram_hash.ensure_cache()
+        ):
+            return None
+        image_mask = image_sentinel_mask(input_ids)
+        return self.engram_hash(
+            input_ids,
+            positions,
+            query_start_loc,
+            image_mask,
+            lookback_token_ids,
+            image_sentinel_mask(lookback_token_ids),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -834,6 +861,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -848,9 +876,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # on the full token stream — before any sequence-parallel sharding —
         # and consumed by the engram layers (1 and 14) below. Profile runs
         # (KV cache unbound) look up dead rows instead.
-        engram_hashes: torch.Tensor | None = None
+        # Under dual batch overlap the model state passes this microbatch's rows
+        # of the hashes of the whole step (`engram_step_hashes`).
+        step_hashes = engram_hashes
+        engram_hashes = None
         engram_mask: torch.Tensor | None = None
-        if (
+        if step_hashes is not None and self.engram_hash is not None:
+            assert input_ids is not None
+            engram_hashes = step_hashes
+            engram_mask = ~image_sentinel_mask(input_ids)
+        elif (
             self.engram_hash is not None
             and input_ids is not None
             and is_forward_context_available()
@@ -1560,6 +1595,9 @@ class DeepseekV41LLMForCausalLM(
 
         return DeepseekV41ModelState
 
+    def engram_step_hashes(self, *args) -> torch.Tensor | None:
+        return self.model.engram_step_hashes(*args)
+
     @property
     def token_lookback_depth(self) -> int:
         """Tokens before a chunk start the engram hash needs; the model runner
@@ -1578,6 +1616,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1585,6 +1624,7 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            engram_hashes=engram_hashes,
         )
         return hidden_states
 

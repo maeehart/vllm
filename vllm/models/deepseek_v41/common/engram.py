@@ -1856,10 +1856,19 @@ class Engram(nn.Module):
             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
         self._prefetch_done = torch.cuda.Event()
 
+    def _staging_offset(self) -> int:
+        """First staging row of the calling microbatch: under dual batch
+        overlap each microbatch stages its rows at its own token offset, so the
+        two do not overwrite each other's rows. 0 outside a microbatch."""
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
+
+        return dbo_current_ubatch_token_offset() * self.embed_tokens.dp_size
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Look up, or prefetch from host memory, rows before the decoder layers
         consume them; DP-sharded tables take the group's gathered hash IDs."""
-        rows = self.staged_rows[: hash_ids.shape[0]]
+        start = self._staging_offset()
+        rows = self.staged_rows[start : start + hash_ids.shape[0]]
         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
         if self._prefetch_stream is None:
             self.embed_tokens.lookup(hash_ids, rows)
@@ -1887,8 +1896,21 @@ class Engram(nn.Module):
             hash_ids.record_stream(stream)
             with torch.cuda.stream(stream):
                 self.embed_tokens.lookup(hash_ids, rows, background=True)
+        self._prefetch_event().record(stream)
+
+    def _prefetch_event(self) -> torch.cuda.Event:
+        """The calling microbatch's prefetch event: one event a microbatch, so
+        one microbatch never waits on the other's lookup."""
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
         assert self._prefetch_done is not None
-        self._prefetch_done.record(stream)
+        ubatch = dbo_current_ubatch_id()
+        if ubatch == 0:
+            return self._prefetch_done
+        events = self.__dict__.setdefault("_ubatch_prefetch_done", {})
+        if ubatch not in events:
+            events[ubatch] = torch.cuda.Event()
+        return events[ubatch]
 
     @eager_break_during_capture
     def _finish_prefetch(self, event: torch.cuda.Event) -> None:
@@ -1897,12 +1919,13 @@ class Engram(nn.Module):
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._prefetch_done is not None:
-            self._finish_prefetch(self._prefetch_done)
+            self._finish_prefetch(self._prefetch_event())
         if self.embed_tokens.dp_size > 1:
             slot = engram_gathered_num_tokens()
             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]
             return _gather_engram_rows(staged, num_tokens)
-        return self.staged_rows[:num_tokens]
+        start = self._staging_offset()
+        return self.staged_rows[start : start + num_tokens]
 
     def set_column_gather(self, gather: Callable[[torch.Tensor], torch.Tensor]) -> None:
         """All-gather the TP-sharded heads and wkv output with `gather` (a
