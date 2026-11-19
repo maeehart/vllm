@@ -90,7 +90,10 @@ from vllm.platforms.rocm import on_gfx942
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_current_ubatch_token_offset,
+)
 
 from ..common.engram import (
     Engram,
@@ -1019,7 +1022,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            # Under dual batch overlap each microbatch writes its own rows of the
+            # step's buffer, at its token offset (0 outside a microbatch).
+            start = dbo_current_ubatch_token_offset()
+            self._mtp_hidden_buffer[start : start + num_tokens].copy_(
+                hidden_states.flatten(1)
+            )
 
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
