@@ -349,7 +349,7 @@ class DeepseekV41ModelState(DefaultModelState):
             return model_inputs
         self._fill_lookback(input_batch, req_states)
         model_inputs["lookback_token_ids"] = self.lookback_token_ids
-        if self.use_ubatching:
+        if getattr(self, "use_ubatching", False):
             # A microbatch can start inside a request's chunk, where its own
             # tokens and the request's lookback row do not hold the two tokens
             # before its first token. The hashes are therefore computed here
