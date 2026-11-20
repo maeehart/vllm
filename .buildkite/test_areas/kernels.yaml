@@ -431,6 +431,7 @@ steps:
           kernels/test_cp_gather_fp8.py
           kernels/test_deepseek_v4_cpu_kernels.py
           kernels/test_dsv41_mega_attn_layouts.py
+          kernels/test_dsv41_ubatch_views.py
           kernels/test_engram.py
           kernels/test_flashinfer_bf16_gemm.py
           kernels/test_flex_attention.py

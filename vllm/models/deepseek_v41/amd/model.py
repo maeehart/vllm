@@ -792,6 +792,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+        if vllm_config.parallel_config.use_ubatching:
+            # Under dual batch overlap the two microbatches take turns inside a
+            # layer group, so the shared top-k and candidate buffers and the
+            # index caches must be per microbatch (ubatch_views.py).
+            from vllm.models.deepseek_v41.amd.ubatch_views import (
+                install_ubatch_views,
+            )
+
+            install_ubatch_views(self)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -923,18 +933,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # hash still has to reach them; the memory profile also has to
                 # see the Engram activations.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
-            if engram_hashes is not None:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                gathered_hashes = gather_engram_hashes(
-                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
-                )
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+        # This lookup must also run for hashes the model state passed in: when
+        # it sat under the branch above, microbatches read stale staging rows.
+        if engram_hashes is not None:
+            # Gather all Engram rows before entering the decoder layers.
+            # One gather feeds every layer sharing the DP-split table.
+            gathered_hashes = gather_engram_hashes(
+                engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
