@@ -789,7 +789,22 @@ class GroupCoordinator:
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_gather(input_, dim)
+        if self is not _TP:
+            return self.device_communicator.all_gather(input_, dim)
+        # all-reduce-overlap: a TP all-gather is a hand-off like the TP
+        # all-reduce, so all TP collectives run in one order on the comm stream.
+        # On the compute stream, one microbatch's all-gather could run beside
+        # the other's all-reduce on the comm stream, and the custom collectives
+        # of the two would wait on each other's signals (a hang on ROCm).
+        from vllm.v1.worker.ubatching import (
+            dbo_switch_to_comm_sync,
+            dbo_yield_and_switch_from_comm_to_compute,
+        )
+
+        dbo_switch_to_comm_sync("all-reduce-overlap")
+        out = self.device_communicator.all_gather(input_, dim)
+        dbo_yield_and_switch_from_comm_to_compute("all-reduce-overlap")
+        return out
 
     def all_gatherv(
         self,
